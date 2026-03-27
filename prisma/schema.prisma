@@ -1,0 +1,200 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── Users ─────────────────────────────────────────────────────────────────────
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  userId       String   @unique // Human-readable ID, e.g. "durvish_a3k9"
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  coordinatedSessions Session[]     @relation("coordinator")
+  deviceSessions      Device[]
+  jobs                TrainingJob[]
+
+  @@map("users")
+}
+
+// ── Sessions ──────────────────────────────────────────────────────────────────
+model Session {
+  id            String        @id @default(cuid())
+  sessionCode   String        @unique // FL-4829 format
+  status        SessionStatus @default(WAITING)
+  coordinatorId String
+  coordinator   User          @relation("coordinator", fields: [coordinatorId], references: [id])
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  expiresAt     DateTime?
+
+  devices Device[]
+  jobs    TrainingJob[]
+
+  @@map("sessions")
+}
+
+// ── Devices ───────────────────────────────────────────────────────────────────
+model Device {
+  id          String       @id @default(cuid())
+  sessionId   String
+  session     Session      @relation(fields: [sessionId], references: [id])
+  userId      String
+  user        User         @relation(fields: [userId], references: [id])
+  deviceName  String
+  os          String       // windows / mac / linux
+  computeType ComputeType  @default(CPU)
+  status      DeviceStatus @default(IDLE)
+  socketId    String?      // current socket connection ID
+
+  // Hardware stats (updated each heartbeat)
+  cpuPercent   Float @default(0)
+  freeRamGb    Float @default(0)
+  totalRamGb   Float @default(0)
+  gpuPercent   Float @default(0)
+  gpuVramUsed  Float @default(0)
+  gpuVramTotal Float @default(0)
+
+  // Scoring
+  reliabilityScore Float @default(1.0) // 0-1, decremented on task failure
+  computeScore     Float @default(0.5) // calculated from formula
+
+  // Heartbeat
+  lastHeartbeat DateTime @default(now())
+
+  // Task tracking
+  activeTasks Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  taskAssignments TaskAssignment[]
+
+  @@map("devices")
+}
+
+// ── Training Jobs ─────────────────────────────────────────────────────────────
+model TrainingJob {
+  id        String    @id @default(cuid())
+  sessionId String
+  session   Session   @relation(fields: [sessionId], references: [id])
+  userId    String
+  user      User      @relation(fields: [userId], references: [id])
+  modelType ModelType
+  status    JobStatus @default(PENDING)
+
+  // Config
+  learningRate Float @default(0.01)
+  numRounds    Int   @default(10)
+  batchSize    Int   @default(32)
+  totalSamples Int   @default(0)
+
+  // Progress
+  currentRound  Int    @default(0)
+  finalAccuracy Float?
+  finalLoss     Float?
+
+  // File paths
+  datasetPath String?
+  modelPath   String?
+
+  // Timing
+  startedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  rounds          TrainingRound[]
+  taskAssignments TaskAssignment[]
+
+  @@map("training_jobs")
+}
+
+// ── Training Rounds ───────────────────────────────────────────────────────────
+model TrainingRound {
+  id       String      @id @default(cuid())
+  jobId    String
+  job      TrainingJob @relation(fields: [jobId], references: [id])
+  roundNum Int
+  loss     Float
+  accuracy Float
+  duration Float       // seconds
+  createdAt DateTime   @default(now())
+
+  @@map("training_rounds")
+}
+
+// ── Task Assignments ──────────────────────────────────────────────────────────
+model TaskAssignment {
+  id       String      @id @default(cuid())
+  jobId    String
+  job      TrainingJob @relation(fields: [jobId], references: [id])
+  deviceId String
+  device   Device      @relation(fields: [deviceId], references: [id])
+  status   AssignmentStatus @default(PENDING)
+
+  shardStart Int // row index start
+  shardEnd   Int // row index end
+  shardSize  Int
+  roundNum   Int
+
+  weightsPath    String?
+  checkpointPath String? // Resume from this checkpoint after fault recovery
+
+  assignedAt  DateTime  @default(now())
+  completedAt DateTime?
+
+  @@map("task_assignments")
+}
+
+// ── Enums ─────────────────────────────────────────────────────────────────────
+enum SessionStatus {
+  WAITING
+  ACTIVE
+  TRAINING
+  COMPLETED
+  EXPIRED
+}
+
+enum DeviceStatus {
+  IDLE
+  ACTIVE
+  TRAINING
+  DROPPED
+  DISCONNECTED
+}
+
+enum ComputeType {
+  CUDA
+  MPS
+  CPU
+}
+
+enum ModelType {
+  LINEAR_REGRESSION
+  LOGISTIC_REGRESSION
+  CNN
+}
+
+enum JobStatus {
+  PENDING
+  RUNNING
+  AGGREGATING
+  COMPLETED
+  FAILED
+  ABORTED
+}
+
+enum AssignmentStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  REASSIGNED
+}
