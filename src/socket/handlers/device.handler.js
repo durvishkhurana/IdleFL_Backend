@@ -46,6 +46,7 @@ export function registerDeviceHandlers(io, socket) {
       io.to(session.id).emit('device:joined', {
         device: {
           id: device.id,
+          deviceId: device.id,
           deviceName: device.deviceName,
           os,
           computeType,

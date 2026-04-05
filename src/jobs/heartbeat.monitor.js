@@ -1,6 +1,6 @@
 /**
  * Background job: scans for devices that haven't sent a heartbeat in 90 seconds.
- * Runs every 30 seconds. Marks timed-out devices as DROPPED and notifies session.
+ * Runs every 30 seconds. Marks timed-out devices as DROPPED and emits device:disconnected to the session room.
  *
  * Fault tolerance flow:
  * 1. No heartbeat for 90s → device marked DROPPED
@@ -55,7 +55,7 @@ async function checkForTimedOutDevices(io) {
     }
 
     if (device.sessionId) {
-      io.to(device.sessionId).emit('device:dropped', {
+      io.to(device.sessionId).emit('device:disconnected', {
         deviceId: device.id,
         reason: 'heartbeat_timeout',
         lastSeen: device.lastHeartbeat,
