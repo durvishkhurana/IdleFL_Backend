@@ -110,6 +110,7 @@ async function checkForTimedOutDevices(io) {
 
           const shard = await getShardPayload({
             datasetPath: activeTask.job.datasetPath,
+            datasetContent: activeTask.job.datasetContent,
             modelType: activeTask.job.modelType,
             shardStart: activeTask.shardStart,
             shardEnd: activeTask.shardEnd,

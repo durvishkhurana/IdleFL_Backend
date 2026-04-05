@@ -14,7 +14,7 @@ export class TrainingService {
     activeTrainingService = this
   }
 
-  async startTraining({ sessionId, modelType, learningRate, numRounds, batchSize, datasetPath, userId }) {
+  async startTraining({ sessionId, modelType, learningRate, numRounds, batchSize, datasetPath, datasetContent, userId }) {
     const session = await prisma.session.findUnique({
       where: { id: sessionId },
       include: { devices: true },
@@ -39,6 +39,7 @@ export class TrainingService {
         status: 'RUNNING',
         startedAt: new Date(),
         datasetPath,
+        datasetContent,
         totalSamples: 1000,
       },
     })
@@ -46,7 +47,15 @@ export class TrainingService {
     await redis.setex(
       REDIS_KEYS.jobState(job.id),
       3600,
-      JSON.stringify({ id: job.id, status: 'RUNNING', currentRound: 0, numRounds, modelType, sessionId, datasetPath })
+      JSON.stringify({
+        id: job.id,
+        status: 'RUNNING',
+        currentRound: 0,
+        numRounds,
+        modelType,
+        sessionId,
+        datasetPath: job.datasetPath,
+      })
     )
 
     await prisma.session.update({ where: { id: sessionId }, data: { status: 'TRAINING' } })
@@ -56,7 +65,8 @@ export class TrainingService {
         jobId: job.id,
         sessionId,
         modelType,
-        datasetPath,
+        datasetPath: job.datasetPath,
+        datasetContent: job.datasetContent,
         learningRate,
         batchSize,
         roundNum: 1,
@@ -183,6 +193,7 @@ export class TrainingService {
    * @param {string} opts.sessionId
    * @param {string} opts.modelType
    * @param {string | null} opts.datasetPath
+   * @param {string | null} opts.datasetContent
    * @param {number} opts.learningRate
    * @param {number} opts.batchSize
    * @param {number} opts.roundNum
@@ -190,8 +201,8 @@ export class TrainingService {
    * @param {Array} opts.devices
    * @returns {Promise<Array<Object>>}
    */
-  async dispatchRound({ jobId, sessionId, modelType, datasetPath, learningRate, batchSize, roundNum, globalWeights, devices }) {
-    const shards = await partitionDataset({ datasetPath, devices, modelType })
+  async dispatchRound({ jobId, sessionId, modelType, datasetPath, datasetContent, learningRate, batchSize, roundNum, globalWeights, devices }) {
+    const shards = await partitionDataset({ datasetPath, datasetContent, devices, modelType })
     const activeDevices = devices.filter((device) => shards.some((shard) => shard.deviceId === device.id))
 
     await prisma.taskAssignment.deleteMany({
@@ -229,7 +240,14 @@ export class TrainingService {
     await redis.setex(
       REDIS_KEYS.jobState(jobId),
       3600,
-      JSON.stringify({ id: jobId, status: 'RUNNING', currentRound: roundNum, sessionId, modelType, datasetPath })
+      JSON.stringify({
+        id: jobId,
+        status: 'RUNNING',
+        currentRound: roundNum,
+        sessionId,
+        modelType,
+        datasetPath,
+      })
     )
     await redis.setex(REDIS_KEYS.jobRound(jobId), 3600, String(roundNum))
 

@@ -112,6 +112,7 @@ async function dispatchNextRound({ io, job, nextRound, globalWeights }) {
     sessionId: job.sessionId,
     modelType: job.modelType,
     datasetPath: job.datasetPath,
+    datasetContent: job.datasetContent,
     learningRate: job.learningRate,
     batchSize: job.batchSize,
     roundNum: nextRound,

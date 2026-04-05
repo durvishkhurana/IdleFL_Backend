@@ -11,27 +11,56 @@ export function initTrainingController(service) {
   trainingService = service
 }
 
-export const uploadDataset = asyncHandler(async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: 'No file uploaded' })
-  }
-
-  const { originalname, filename, size, path: filePath } = req.file
-  res.json({
-    message: 'Dataset uploaded successfully',
-    file: { originalname, filename, size, path: filePath },
-  })
-})
+function stripDatasetContent(job) {
+  if (!job) return job
+  const { datasetContent: _omit, ...rest } = job
+  return rest
+}
 
 export const startTraining = asyncHandler(async (req, res) => {
   const { sessionId, modelType, learningRate, numRounds, batchSize } = req.body
-  const datasetPath = req.body.datasetPath || null
+  const file = req.file
+  const demoMode = process.env.DEMO_MODE === 'true'
+
+  let datasetContent = null
+  let datasetPath = null
+
+  if (!demoMode) {
+    if (modelType === 'LINEAR_REGRESSION' || modelType === 'LOGISTIC_REGRESSION') {
+      if (!file) {
+        return res.status(400).json({ error: 'CSV dataset file is required for this model type' })
+      }
+      const ext = file.originalname.toLowerCase().endsWith('.csv')
+      if (!ext) {
+        return res.status(400).json({ error: 'A .csv file is required for tabular models' })
+      }
+      datasetContent = file.buffer.toString('utf8')
+    } else if (modelType === 'CNN') {
+      if (!file) {
+        return res.status(400).json({ error: 'ZIP dataset file is required for CNN' })
+      }
+      if (!file.originalname.toLowerCase().endsWith('.zip')) {
+        return res.status(400).json({ error: 'A .zip file is required for CNN' })
+      }
+      datasetPath = file.originalname
+    }
+  }
 
   const result = await trainingService.startTraining({
-    sessionId, modelType, learningRate, numRounds, batchSize, datasetPath, userId: req.user.id,
+    sessionId,
+    modelType,
+    learningRate,
+    numRounds,
+    batchSize,
+    datasetPath,
+    datasetContent,
+    userId: req.user.id,
   })
 
-  res.status(201).json(result)
+  res.status(201).json({
+    job: stripDatasetContent(result.job),
+    eligibleDevices: result.eligibleDevices,
+  })
 })
 
 export const abortTraining = asyncHandler(async (req, res) => {
@@ -41,11 +70,11 @@ export const abortTraining = asyncHandler(async (req, res) => {
 
 export const getResults = asyncHandler(async (req, res) => {
   const job = await trainingService.getJobResults(req.params.jobId, req.user.id)
-  res.json({ job })
+  res.json({ job: stripDatasetContent(job) })
 })
 
 export const downloadModel = asyncHandler(async (req, res) => {
-  const job = await trainingService.getJobResults(req.params.jobId, req.user.id)
+  const job = stripDatasetContent(await trainingService.getJobResults(req.params.jobId, req.user.id))
 
   if (job.status !== 'COMPLETED') {
     return res.status(400).json({ error: 'Training job is not completed yet' })
