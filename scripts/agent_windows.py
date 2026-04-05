@@ -174,6 +174,11 @@ def _train_linear_regression(data_shard, config):
     task_data = config
     checkpoint_interval = int(task_data.get("checkpointInterval", 10))
 
+    # Scale learning rate based on feature magnitude to prevent explosion
+    feature_scale = np.sqrt(np.mean(x ** 2))
+    if feature_scale > 1:
+        learning_rate = learning_rate / (feature_scale ** 2)
+
     if global_weights and len(global_weights) == num_features + 1:
         params = np.asarray(global_weights, dtype=np.float64)
         weights = params[:-1].copy()
@@ -220,6 +225,11 @@ def _train_logistic_regression(data_shard, config):
     global_weights = _config_value(config, "global_weights", "globalWeights", None)
     task_data = config
     checkpoint_interval = int(task_data.get("checkpointInterval", 10))
+
+    # Scale learning rate based on feature magnitude to prevent explosion
+    feature_scale = np.sqrt(np.mean(x ** 2))
+    if feature_scale > 1:
+        learning_rate = learning_rate / (feature_scale ** 2)
 
     unique_labels = np.unique(y)
     is_binary = unique_labels.size <= 2
