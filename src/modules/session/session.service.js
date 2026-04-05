@@ -22,7 +22,7 @@ export class SessionService {
       data: {
         sessionCode,
         coordinatorId: userId,
-        status: 'WAITING',
+        status: 'ACTIVE',
         expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24h TTL
       },
       include: { coordinator: { select: { email: true, userId: true } } },
@@ -32,7 +32,7 @@ export class SessionService {
     await redis.setex(
       REDIS_KEYS.sessionInfo(session.id),
       86400,
-      JSON.stringify({ id: session.id, sessionCode, coordinatorId: userId, status: 'WAITING' })
+      JSON.stringify({ id: session.id, sessionCode, coordinatorId: userId, status: 'ACTIVE' })
     )
 
     logger.info(`Session created: ${sessionCode} by user ${userId}`)

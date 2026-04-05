@@ -63,8 +63,10 @@ export class AuthService {
       throw error
     }
 
-    if (session.status !== 'ACTIVE') {
-      const error = new Error(`Session is not active (current status: ${session.status})`)
+    // Coordinators create sessions as ACTIVE; allow WAITING for legacy rows still in the DB.
+    const canJoin = session.status === 'ACTIVE' || session.status === 'WAITING'
+    if (!canJoin) {
+      const error = new Error(`Session is not accepting agents (current status: ${session.status})`)
       error.status = 403
       throw error
     }
