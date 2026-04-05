@@ -1,4 +1,5 @@
 import { Server } from 'socket.io'
+import { prisma } from '../config/database.js'
 import { socketAuthMiddleware } from './socket.auth.js'
 import { registerDeviceHandlers } from './handlers/device.handler.js'
 import { registerTrainingHandlers } from './handlers/training.handler.js'
@@ -27,10 +28,15 @@ export function createSocketServer(httpServer) {
     registerTerminalHandlers(io, socket)
 
     // Coordinator joins their session room (from frontend)
-    socket.on('join:session', (sessionId) => {
+    socket.on('join:session', async (sessionId) => {
       socket.join(sessionId)
       socket.sessionId = sessionId
-      logger.debug(`${socket.user.email} joined room: ${sessionId}`)
+      const session = await prisma.session.findUnique({
+        where: { id: sessionId },
+        select: { sessionCode: true },
+      })
+      const sessionCode = session?.sessionCode ?? sessionId
+      logger.info(`Device joined session: ${sessionCode} — user ${socket.user.userId} socket ${socket.id}`)
     })
 
     socket.on('disconnect', (reason) => {
