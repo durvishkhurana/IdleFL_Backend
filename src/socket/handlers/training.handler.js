@@ -305,31 +305,51 @@ export function registerTrainingHandlers(io, socket) {
     }
   })
 
-  socket.on('training:checkpoint', async ({ jobId, roundNum, checkpointData }) => {
+  socket.on('training:checkpoint_fetch', async ({ checkpointPath, checkpointKey }) => {
     try {
-      if (!socket.deviceId) {
+      const key = checkpointKey || checkpointPath
+      if (!key) {
+        socket.emit('training:checkpoint_data', { weights: null, error: 'no_path' })
         return
       }
 
-      const checkpointKey = `${REDIS_KEYS.jobWeights(jobId, roundNum)}:checkpoint`
+      const raw = await redis.get(key)
+      if (!raw) {
+        socket.emit('training:checkpoint_data', { weights: null, error: 'not_found' })
+        logger.warn(`Checkpoint not found in Redis: ${key}`)
+        return
+      }
+
+      const parsed = JSON.parse(raw)
+      const weights = parsed?.weights || parsed?.checkpointData || null
+      socket.emit('training:checkpoint_data', { weights })
+      logger.debug(`Checkpoint fetched for device ${socket.deviceId}: ${key}`)
+    } catch (error) {
+      logger.error('training:checkpoint_fetch error:', error)
+      socket.emit('training:checkpoint_data', { weights: null, error: 'fetch_failed' })
+    }
+  })
+
+  socket.on('training:checkpoint', async ({ taskId, jobId, roundNum, checkpointData }) => {
+    try {
+      if (!socket.deviceId || !taskId || !jobId) {
+        return
+      }
+
+      const checkpointKey = `checkpoint:${jobId}:${taskId}`
       await redis.setex(
         checkpointKey,
         CHECKPOINT_TTL_SECONDS,
         JSON.stringify({ deviceId: socket.deviceId, checkpointData, updatedAt: new Date().toISOString() })
       )
 
-      await prisma.taskAssignment.updateMany({
-        where: {
-          jobId,
-          roundNum,
-          deviceId: socket.deviceId,
-          status: { in: ['PENDING', 'IN_PROGRESS'] },
-        },
+      await prisma.taskAssignment.update({
+        where: { id: taskId },
         data: { checkpointPath: checkpointKey },
       })
 
       socket.emit('training:checkpoint_ack', { jobId, roundNum })
-      logger.debug(`Checkpoint received: device ${socket.deviceId}, job ${jobId}, round ${roundNum}`)
+      logger.debug(`Checkpoint received: device ${socket.deviceId}, job ${jobId}, task ${taskId}, round ${roundNum}`)
     } catch (error) {
       logger.error('training:checkpoint error:', error)
     }

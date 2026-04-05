@@ -8,6 +8,7 @@ import { startHeartbeatMonitor } from './src/jobs/heartbeat.monitor.js'
 import { TrainingService } from './src/modules/training/training.service.js'
 import { initTrainingController } from './src/modules/training/training.controller.js'
 import { logger } from './src/config/logger.js'
+import { prisma } from './src/config/database.js'
 
 const PORT = process.env.PORT || 4000
 
@@ -23,6 +24,18 @@ async function bootstrap() {
   initTrainingController(trainingService)
 
   startHeartbeatMonitor(io)
+
+  setInterval(async () => {
+    const now = new Date();
+    const result = await prisma.session.updateMany({
+      where: {
+        status: { in: ['WAITING', 'ACTIVE'] },
+        expiresAt: { lt: now }
+      },
+      data: { status: 'EXPIRED' }
+    });
+    logger.info(`Session expiry job: flipped ${result.count} sessions to EXPIRED`);
+  }, 5 * 60 * 1000);
 
   httpServer.listen(PORT, () => {
     logger.info(``)

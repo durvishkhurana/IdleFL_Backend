@@ -45,10 +45,14 @@ async function checkForTimedOutDevices(io) {
   for (const device of timedOut) {
     logger.warn(`Device timed out: ${device.id} (${device.deviceName}) in session ${device.session?.sessionCode}`)
 
-    await prisma.device.update({
+    const droppedDevice = await prisma.device.update({
       where: { id: device.id },
-      data: { status: 'DROPPED', socketId: null },
+      data: { status: 'DROPPED', socketId: null, reliabilityScore: { decrement: 0.1 } },
+      select: { reliabilityScore: true },
     })
+    if (droppedDevice.reliabilityScore < 0) {
+      await prisma.device.update({ where: { id: device.id }, data: { reliabilityScore: 0 } })
+    }
 
     if (device.sessionId) {
       io.to(device.sessionId).emit('device:dropped', {
@@ -77,7 +81,7 @@ async function checkForTimedOutDevices(io) {
 
         await prisma.taskAssignment.update({ where: { id: activeTask.id }, data: { status: 'REASSIGNED' } })
 
-        await prisma.taskAssignment.create({
+        const newAssignment = await prisma.taskAssignment.create({
           data: {
             jobId: activeTask.jobId,
             deviceId: bestDevice.id,
@@ -112,6 +116,7 @@ async function checkForTimedOutDevices(io) {
           })
 
           io.to(bestDevice.socketId).emit('training:task_assigned', {
+            taskId: newAssignment.id,
             jobId: activeTask.jobId,
             roundNum: activeTask.roundNum,
             modelType: activeTask.job.modelType,

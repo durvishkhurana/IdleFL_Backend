@@ -4,6 +4,7 @@ import { filterEligibleDevices } from '../../utils/deviceScoring.js'
 import { partitionDataset } from '../../utils/dataPartitioner.js'
 import { fedAvgAggregate, generateMockWeights } from './fedavg.js'
 import { logger } from '../../config/logger.js'
+import { config } from '../../config/app.js'
 
 let activeTrainingService = null
 
@@ -201,17 +202,21 @@ export class TrainingService {
       },
     })
 
-    await prisma.taskAssignment.createMany({
-      data: shards.map((shard) => ({
-        jobId,
-        deviceId: shard.deviceId,
-        status: 'IN_PROGRESS',
-        shardStart: shard.shardStart,
-        shardEnd: shard.shardEnd,
-        shardSize: shard.shardSize,
-        roundNum,
-      })),
-    })
+    const assignmentsByDeviceId = new Map()
+    for (const shard of shards) {
+      const assignment = await prisma.taskAssignment.create({
+        data: {
+          jobId,
+          deviceId: shard.deviceId,
+          status: 'IN_PROGRESS',
+          shardStart: shard.shardStart,
+          shardEnd: shard.shardEnd,
+          shardSize: shard.shardSize,
+          roundNum,
+        },
+      })
+      assignmentsByDeviceId.set(shard.deviceId, assignment)
+    }
 
     await prisma.trainingJob.update({
       where: { id: jobId },
@@ -252,7 +257,9 @@ export class TrainingService {
       this.io.to(sessionId).emit('device:status_update', { deviceId: device.id, status: 'TRAINING' })
 
       if (device.socketId) {
+        const assignment = assignmentsByDeviceId.get(device.id)
         this.io.to(device.socketId).emit('training:task_assigned', {
+          taskId: assignment.id,
           jobId,
           roundNum,
           modelType,
@@ -261,6 +268,7 @@ export class TrainingService {
             batchSize,
             epochs: 1,
             globalWeights,
+            checkpointInterval: config.checkpointInterval,
             learning_rate: learningRate,
             batch_size: batchSize,
             global_weights: globalWeights,

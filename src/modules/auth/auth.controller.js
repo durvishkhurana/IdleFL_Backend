@@ -13,6 +13,11 @@ export const login = asyncHandler(async (req, res) => {
   res.json(result)
 })
 
+export const agentLogin = asyncHandler(async (req, res) => {
+  const result = await authService.agentLogin(req.body)
+  res.json(result)
+})
+
 export const getMe = asyncHandler(async (req, res) => {
   const user = await authService.getMe(req.user.id)
   res.json({ user })

@@ -48,10 +48,50 @@ export class AuthService {
     return { user: safeUser, token }
   }
 
+  async agentLogin({ agentId, sessionCode }) {
+    const user = await prisma.user.findUnique({ where: { userId: agentId } })
+    if (!user) {
+      const error = new Error('Agent ID not found')
+      error.status = 401
+      throw error
+    }
+
+    const session = await prisma.session.findUnique({ where: { sessionCode } })
+    if (!session) {
+      const error = new Error('Session not found')
+      error.status = 404
+      throw error
+    }
+
+    if (session.status !== 'ACTIVE') {
+      const error = new Error(`Session is not active (current status: ${session.status})`)
+      error.status = 403
+      throw error
+    }
+
+    if (session.expiresAt && session.expiresAt < new Date()) {
+      const error = new Error('Session has expired')
+      error.status = 403
+      throw error
+    }
+
+    const token = this.signAgentToken(user.id, session.id)
+    logger.info(`Agent login: ${agentId} joined session ${sessionCode}`)
+    return { token, userId: user.userId, sessionId: session.id, role: 'agent' }
+  }
+
   signToken(userId) {
     return jwt.sign({ userId }, process.env.JWT_SECRET, {
       expiresIn: process.env.JWT_EXPIRES_IN || '7d',
     })
+  }
+
+  signAgentToken(userId, sessionId) {
+    return jwt.sign(
+      { userId, sessionId, role: 'agent' },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_AGENT_EXPIRES_IN || '24h' }
+    )
   }
 
   async getMe(userId) {

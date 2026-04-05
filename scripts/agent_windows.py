@@ -3,28 +3,33 @@ IdleFL Agent - Windows / CUDA
 Connects to the IdleFL server, trains on a local shard, and returns weights.
 
 SETUP:
-  1. pip install torch torchvision numpy websockets psutil aiohttp
+  1. pip install torch torchvision numpy "python-socketio[client]" aiohttp psutil
   2. Edit USER_ID and SESSION_ID below, then run: python agent_windows.py
 """
 
 import asyncio
-import json
 import math
 import os
 import platform
+import shlex
 import subprocess
 import time
 
+import aiohttp
 import numpy as np
 import psutil
-import websockets
+import socketio
 
-USER_ID = "paste_your_user_id_here"
-SESSION_ID = "FL-XXXX"
+USER_ID = "paste_your_user_id_here"  # Your permanent agent ID (e.g. "durvish_a3k9")
+SESSION_ID = "FL-XXXX"               # Session code shown on the dashboard (e.g. "FL-4829")
+
+# For demo purposes you can paste a JWT directly here instead of using login.
+# Leave empty to authenticate via POST /api/auth/agent-login at startup.
+JWT_TOKEN = ""
 
 # Server URL is injected at download time by the IdleFL server.
 # Do not edit this line manually - download the script fresh from the dashboard.
-WS_URL = 'SERVER_URL_PLACEHOLDER'
+SERVER_URL = 'SERVER_URL_PLACEHOLDER'
 
 HEARTBEAT_INTERVAL_SECONDS = 30
 DEFAULT_LEARNING_RATE = 0.01
@@ -106,6 +111,31 @@ def _config_value(config, snake_key, camel_key, default_value):
     return default_value
 
 
+def _emit_training_checkpoint(config, weights, iteration):
+    """Schedules training:checkpoint on the main asyncio loop (when training runs in a thread)."""
+    if not config:
+        return
+    main_loop = config.get("_main_loop")
+    sio = config.get("_sio")
+    task_id = config.get("taskId")
+    job_id = config.get("jobId")
+    round_num = config.get("roundNum")
+    if not main_loop or not sio or task_id is None:
+        return
+    asyncio.run_coroutine_threadsafe(
+        sio.emit(
+            "training:checkpoint",
+            {
+                "taskId": task_id,
+                "jobId": job_id,
+                "roundNum": round_num,
+                "checkpointData": weights,
+            },
+        ),
+        main_loop,
+    )
+
+
 def _mock_result(model_type, weight_size=MOCK_WEIGHT_SIZE):
     """Builds a deterministic fallback payload when real training is unavailable."""
     base_size = {"LINEAR_REGRESSION": max(weight_size, 4), "LOGISTIC_REGRESSION": max(weight_size, 8), "CNN": max(weight_size, 64)}
@@ -141,6 +171,8 @@ def _train_linear_regression(data_shard, config):
     learning_rate = float(_config_value(config, "learning_rate", "learningRate", DEFAULT_LEARNING_RATE))
     epochs = int(_config_value(config, "epochs", "epochs", DEFAULT_EPOCHS))
     global_weights = _config_value(config, "global_weights", "globalWeights", None)
+    task_data = config
+    checkpoint_interval = int(task_data.get("checkpointInterval", 10))
 
     if global_weights and len(global_weights) == num_features + 1:
         params = np.asarray(global_weights, dtype=np.float64)
@@ -151,7 +183,7 @@ def _train_linear_regression(data_shard, config):
         bias = 0.0
 
     loss = 0.0
-    for _ in range(epochs):
+    for iteration in range(1, epochs + 1):
         prediction = x @ weights + bias
         residual = prediction - y
         loss = float(np.mean(residual ** 2))
@@ -159,6 +191,12 @@ def _train_linear_regression(data_shard, config):
         grad_b = (2.0 / num_samples) * np.sum(residual)
         weights -= learning_rate * grad_w
         bias -= learning_rate * grad_b
+        if checkpoint_interval > 0 and iteration % checkpoint_interval == 0:
+            _emit_training_checkpoint(
+                config,
+                weights.astype(float).tolist() + [float(bias)],
+                iteration,
+            )
 
     prediction = x @ weights + bias
     residual = prediction - y
@@ -180,6 +218,8 @@ def _train_logistic_regression(data_shard, config):
     batch_size = int(_config_value(config, "batch_size", "batchSize", DEFAULT_BATCH_SIZE))
     epochs = int(_config_value(config, "epochs", "epochs", DEFAULT_EPOCHS))
     global_weights = _config_value(config, "global_weights", "globalWeights", None)
+    task_data = config
+    checkpoint_interval = int(task_data.get("checkpointInterval", 10))
 
     unique_labels = np.unique(y)
     is_binary = unique_labels.size <= 2
@@ -195,9 +235,11 @@ def _train_logistic_regression(data_shard, config):
             weights = np.zeros(num_features, dtype=np.float64)
             bias = 0.0
 
+        iteration = 0
         for _ in range(epochs):
             indices = np.random.permutation(num_samples)
             for start in range(0, num_samples, max(batch_size, 1)):
+                iteration += 1
                 batch_idx = indices[start:start + batch_size]
                 x_batch = x[batch_idx]
                 y_batch = y_binary[batch_idx]
@@ -208,6 +250,12 @@ def _train_logistic_regression(data_shard, config):
                 grad_b = float(np.mean(error))
                 weights -= learning_rate * grad_w
                 bias -= learning_rate * grad_b
+                if checkpoint_interval > 0 and iteration % checkpoint_interval == 0:
+                    _emit_training_checkpoint(
+                        config,
+                        weights.astype(float).tolist() + [float(bias)],
+                        iteration,
+                    )
 
         final_prediction = _sigmoid(x @ weights + bias)
         predicted_labels = (final_prediction >= 0.5).astype(int)
@@ -228,9 +276,11 @@ def _train_logistic_regression(data_shard, config):
         weights = np.zeros((num_features, num_classes), dtype=np.float64)
         bias = np.zeros(num_classes, dtype=np.float64)
 
+    iteration = 0
     for _ in range(epochs):
         indices = np.random.permutation(num_samples)
         for start in range(0, num_samples, max(batch_size, 1)):
+            iteration += 1
             batch_idx = indices[start:start + batch_size]
             x_batch = x[batch_idx]
             y_batch = y_indices[batch_idx]
@@ -243,6 +293,12 @@ def _train_logistic_regression(data_shard, config):
             grad_b = np.mean(error, axis=0)
             weights -= learning_rate * grad_w
             bias -= learning_rate * grad_b
+            if checkpoint_interval > 0 and iteration % checkpoint_interval == 0:
+                _emit_training_checkpoint(
+                    config,
+                    weights.astype(float).reshape(-1).tolist() + bias.astype(float).tolist(),
+                    iteration,
+                )
 
     final_logits = x @ weights + bias
     predicted_indices = np.argmax(final_logits, axis=1)
@@ -324,6 +380,8 @@ def _train_cnn(data_shard, config):
     batch_size = int(_config_value(config, "batch_size", "batchSize", DEFAULT_BATCH_SIZE))
     epochs = int(_config_value(config, "epochs", "epochs", DEFAULT_EPOCHS))
     learning_rate = float(_config_value(config, "learning_rate", "learningRate", DEFAULT_LEARNING_RATE))
+    task_data = config
+    checkpoint_interval = int(task_data.get("checkpointInterval", 10))
 
     loader = DataLoader(subset, batch_size=max(batch_size, 1), shuffle=True)
     criterion = nn.CrossEntropyLoss()
@@ -332,8 +390,10 @@ def _train_cnn(data_shard, config):
 
     last_loss = 0.0
     model.train()
+    iteration = 0
     for _ in range(epochs):
         for batch_x, batch_y in loader:
+            iteration += 1
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
             optimizer.zero_grad()
@@ -342,6 +402,11 @@ def _train_cnn(data_shard, config):
             loss.backward()
             optimizer.step()
             last_loss = float(loss.item())
+            if checkpoint_interval > 0 and iteration % checkpoint_interval == 0:
+                flat_weights = []
+                for parameter in model.parameters():
+                    flat_weights.extend(parameter.data.detach().cpu().numpy().astype(float).reshape(-1).tolist())
+                _emit_training_checkpoint(config, flat_weights, iteration)
 
     model.eval()
     correct = 0
@@ -400,93 +465,202 @@ def train_locally(model_type, data_shard, config):
 
 
 async def run_agent():
-    """Connects to the IdleFL backend and handles training tasks over WebSocket."""
+    """Connects to the IdleFL backend and handles training tasks over Socket.IO."""
     prevent_sleep()
     compute_type = detect_hardware()
 
     print(f"\n  IdleFL Agent - {platform.system()} / {compute_type}")
-    print(f"  Connecting to {WS_URL}...\n")
 
-    uri = f"{WS_URL}/socket.io/?transport=websocket"
+    token = JWT_TOKEN
+    if not token:
+        print(f"  Authenticating as agent {USER_ID} for session {SESSION_ID}...")
+        async with aiohttp.ClientSession() as http:
+            resp = await http.post(
+                f"{SERVER_URL}/api/auth/agent-login",
+                json={"agentId": USER_ID, "sessionCode": SESSION_ID},
+            )
+            body = await resp.json()
+            token = body.get("token") or (body.get("data") or {}).get("token", "")
+        if not token:
+            print("[✗] Agent login failed - check USER_ID and SESSION_ID")
+            print(f"    Server response: {body.get('error', 'unknown error')}")
+            return
 
-    async with websockets.connect(uri) as ws:
+    print(f"  Connecting to {SERVER_URL}...\n")
+
+    sio = socketio.AsyncClient(reconnection=True, reconnection_attempts=10, reconnection_delay=2)
+
+    # Shared state for the one-at-a-time checkpoint fetch handshake (agent-pull).
+    _pending_checkpoint = {}
+    # Server-pushed checkpoint weights indexed by taskId (for reassignment flow).
+    _pending_checkpoints = {}
+
+    @sio.on("training:checkpoint_data")
+    async def on_checkpoint_data(data):
+        evt = _pending_checkpoint.get("event")
+        if evt and not evt.is_set():
+            _pending_checkpoint["weights"] = data.get("weights")
+            evt.set()
+
+    @sio.on("training:checkpoint_fetch")
+    async def on_server_checkpoint_fetch(data):
+        """Handles server-push checkpoint notification during device reassignment (check 5).
+
+        Server emits: { taskId, checkpointKey }
+        Agent fetches the checkpoint data using the key and stores it so that
+        on_task_assigned can inject it into globalWeights before training starts.
+        """
+        task_id = data.get("taskId")
+        checkpoint_key = data.get("checkpointKey")
+        if not task_id or not checkpoint_key:
+            return
+        print(f"[●] Server pushed checkpoint for task {task_id}: {checkpoint_key}")
+        evt = asyncio.Event()
+        _pending_checkpoint["event"] = evt
+        _pending_checkpoint["weights"] = None
+        await sio.emit("training:checkpoint_fetch", {"checkpointKey": checkpoint_key})
+        try:
+            await asyncio.wait_for(evt.wait(), timeout=5.0)
+            weights = _pending_checkpoint.get("weights")
+            _pending_checkpoints[task_id] = weights
+            if weights:
+                print(f"[✓] Checkpoint pre-loaded for task {task_id}: {len(weights)} weights")
+            else:
+                print(f"[⚠] Checkpoint empty for task {task_id} - will train from scratch")
+        except asyncio.TimeoutError:
+            print(f"[⚠] Checkpoint pre-load timed out for task {task_id}")
+            _pending_checkpoints[task_id] = None
+        finally:
+            _pending_checkpoint.clear()
+
+    @sio.event
+    async def connect():
         print("[✓] Connected to server")
+        await sio.emit("device:register", {
+            "sessionCode": SESSION_ID,
+            "os": platform.system().lower(),
+            "computeType": compute_type,
+        })
 
-        await ws.send(json.dumps({
-            "event": "device:register",
-            "data": {
-                "sessionCode": SESSION_ID,
-                "os": platform.system().lower(),
-                "computeType": compute_type,
-            }
-        }))
+    @sio.event
+    async def disconnect():
+        print("[●] Disconnected from server")
 
-        async def heartbeat_loop():
-            while True:
-                await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
-                stats = get_stats()
-                await ws.send(json.dumps({
-                    "event": "heartbeat",
-                    "data": {**stats, "computeType": compute_type}
-                }))
+    @sio.on("device:registered")
+    async def on_device_registered(data):
+        print(f"[✓] Registered as device: {data.get('deviceId')}")
+        print("[●] Waiting for training job...\n")
 
-        asyncio.create_task(heartbeat_loop())
+    @sio.on("training:started")
+    async def on_training_started(data):
+        print(f"[●] Training job started: {data.get('modelType')}")
 
-        async for message in ws:
-            data = json.loads(message)
-            event = data.get("event")
-            payload = data.get("data", {})
+    @sio.on("training:task_assigned")
+    async def on_task_assigned(data):
+        job_id = data.get("jobId")
+        round_num = data.get("roundNum")
+        task_id = data.get("taskId")
+        model_type = data.get("modelType")
+        config = data.get("config", {}) or {}
+        config["round_num"] = round_num
+        config["roundNum"] = round_num
+        config["jobId"] = job_id
+        config["taskId"] = task_id
+        if data.get("checkpointInterval") is not None:
+            config["checkpointInterval"] = data["checkpointInterval"]
+        config["_sio"] = sio
+        config["_main_loop"] = asyncio.get_running_loop()
+        shard = data.get("shard")
 
-            if event == "device:registered":
-                print(f"[✓] Registered as device: {payload.get('deviceId')}")
-                print("[●] Waiting for training job...\n")
-
-            elif event == "training:started":
-                print(f"[●] Training job started: {payload.get('modelType')}")
-
-            elif event == "training:task_assigned":
-                job_id = payload.get("jobId")
-                round_num = payload.get("roundNum")
-                model_type = payload.get("modelType")
-                config = payload.get("config", {}) or {}
-                config["round_num"] = round_num
-                shard = payload.get("shard")
-
-                print(f"\n[●] Round {round_num} - training {model_type}...")
-                result = train_locally(model_type, shard, config)
-                print(f"[●] Sending weights ({len(result['weights'])} floats)...")
-
-                await ws.send(json.dumps({
-                    "event": "training:weights_ready",
-                    "data": {
-                        "jobId": job_id,
-                        "roundNum": round_num,
-                        "weights": result["weights"],
-                        "loss": result["loss"],
-                        "accuracy": result["accuracy"],
-                    }
-                }))
-                print("[✓] Weights sent")
-
-            elif event == "training:complete":
-                print("\n[✓] Training complete!")
-                print(f"[✓] Final accuracy: {payload.get('finalAccuracy', 0) * 100:.1f}%")
-                print(f"[✓] Final loss: {payload.get('finalLoss', 0):.4f}")
-
-            elif event == "terminal:execute":
-                command = payload.get("command", "")
-                from_socket = payload.get("fromSocketId")
-                print(f"[●] Terminal command received: {command}")
+        # Priority 1: use weights pre-loaded by server-push training:checkpoint_fetch (check 5 & 6).
+        server_weights = _pending_checkpoints.pop(task_id, None) if task_id else None
+        if server_weights:
+            config["globalWeights"] = server_weights
+            print(f"[✓] Using server-pushed checkpoint for task {task_id}: {len(server_weights)} weights")
+        else:
+            # Priority 2: agent-pull — server embedded checkpointKey in the task payload.
+            checkpoint_key = (
+                data.get("checkpointKey") or config.get("checkpointPath") or data.get("checkpointPath") or ""
+            ).strip()
+            if checkpoint_key:
+                print(f"[●] Fetching checkpoint from server: {checkpoint_key}")
+                evt = asyncio.Event()
+                _pending_checkpoint["event"] = evt
+                _pending_checkpoint["weights"] = None
+                await sio.emit("training:checkpoint_fetch", {"checkpointKey": checkpoint_key})
                 try:
-                    result = subprocess.run(command, shell=False, capture_output=True, text=True, timeout=10)
-                    output = result.stdout + result.stderr
-                except Exception as error:
-                    output = str(error)
+                    await asyncio.wait_for(evt.wait(), timeout=5.0)
+                    received_weights = _pending_checkpoint.get("weights")
+                    if received_weights:
+                        config["globalWeights"] = received_weights
+                        print(f"[✓] Checkpoint loaded: {len(received_weights)} weights")
+                    else:
+                        print("[⚠] Checkpoint payload empty - training from scratch")
+                except asyncio.TimeoutError:
+                    print("[⚠] Checkpoint fetch timed out (5s) - training from scratch")
+                finally:
+                    _pending_checkpoint.clear()
 
-                await ws.send(json.dumps({
-                    "event": "terminal:output",
-                    "data": {"data": output + "\r\n", "targetSocketId": from_socket}
-                }))
+        print(f"\n[●] Round {round_num} - training {model_type}...")
+        result = await asyncio.to_thread(train_locally, model_type, shard, config)
+        print(f"[●] Sending weights ({len(result['weights'])} floats)...")
+
+        await sio.emit("training:weights_ready", {
+            "jobId": job_id,
+            "roundNum": round_num,
+            "weights": result["weights"],
+            "loss": result["loss"],
+            "accuracy": result["accuracy"],
+        })
+        print("[✓] Weights sent")
+
+    @sio.on("training:complete")
+    async def on_training_complete(data):
+        print("\n[✓] Training complete!")
+        print(f"[✓] Final accuracy: {data.get('finalAccuracy', 0) * 100:.1f}%")
+        print(f"[✓] Final loss: {data.get('finalLoss', 0):.4f}")
+
+    COMMAND_WHITELIST = {
+        "python", "python3", "pip", "pip3",
+        "nvidia-smi", "dir", "echo", "whoami",
+        "where", "ipconfig", "tasklist", "systeminfo",
+        "hostname", "ver",
+    }
+
+    @sio.on("terminal:execute")
+    async def on_terminal_execute(data):
+        command = data.get("command", "")
+        from_socket = data.get("fromSocketId")
+        print(f"[●] Terminal command received: {command}")
+
+        args = shlex.split(command)
+        if not args or args[0] not in COMMAND_WHITELIST:
+            denied = args[0] if args else "<empty>"
+            print(f"[✗] Command denied (not whitelisted): {denied}")
+            await sio.emit("terminal:output", {
+                "data": f"[error] Command not allowed: {denied}\r\n",
+                "targetSocketId": from_socket,
+            })
+            return
+
+        try:
+            proc = subprocess.run(args, shell=False, capture_output=True, text=True, timeout=10)
+            output = proc.stdout + proc.stderr
+        except Exception as error:
+            output = str(error)
+
+        await sio.emit("terminal:output", {"data": output + "\r\n", "targetSocketId": from_socket})
+
+    async def heartbeat_loop():
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            if sio.connected:
+                stats = get_stats()
+                await sio.emit("heartbeat", {**stats, "computeType": compute_type})
+
+    await sio.connect(SERVER_URL, auth={"token": token}, transports=["websocket"])
+    asyncio.create_task(heartbeat_loop())
+    await sio.wait()
 
 
 if __name__ == "__main__":
