@@ -15,6 +15,14 @@ export class TrainingService {
   }
 
   async startTraining({ sessionId, modelType, learningRate, numRounds, batchSize, datasetPath, datasetContent, userId }) {
+    const parsedLearningRate = parseFloat(learningRate)
+    const parsedNumRounds = parseInt(numRounds, 10)
+    const parsedBatchSize = parseInt(batchSize, 10)
+
+    if (Number.isNaN(parsedLearningRate) || Number.isNaN(parsedNumRounds) || Number.isNaN(parsedBatchSize)) {
+      throw Object.assign(new Error('Invalid hyperparameters'), { status: 400 })
+    }
+
     const session = await prisma.session.findUnique({
       where: { id: sessionId },
       include: { devices: true },
@@ -33,9 +41,9 @@ export class TrainingService {
         sessionId,
         userId,
         modelType,
-        learningRate,
-        numRounds,
-        batchSize,
+        learningRate: parsedLearningRate,
+        numRounds: parsedNumRounds,
+        batchSize: parsedBatchSize,
         status: 'RUNNING',
         startedAt: new Date(),
         datasetPath,
@@ -51,7 +59,7 @@ export class TrainingService {
         id: job.id,
         status: 'RUNNING',
         currentRound: 0,
-        numRounds,
+        numRounds: parsedNumRounds,
         modelType,
         sessionId,
         datasetPath: job.datasetPath,
@@ -67,8 +75,8 @@ export class TrainingService {
         modelType,
         datasetPath: job.datasetPath,
         datasetContent: job.datasetContent,
-        learningRate,
-        batchSize,
+        learningRate: parsedLearningRate,
+        batchSize: parsedBatchSize,
         roundNum: 1,
         globalWeights: null,
         devices: eligible,
@@ -78,9 +86,9 @@ export class TrainingService {
     this.io.to(sessionId).emit('training:started', {
       jobId: job.id,
       modelType,
-      learningRate,
-      numRounds,
-      batchSize,
+      learningRate: parsedLearningRate,
+      numRounds: parsedNumRounds,
+      batchSize: parsedBatchSize,
     })
 
     logger.info(`Training started: job ${job.id}, session ${sessionId}, ${eligible.length} devices`)
@@ -131,16 +139,26 @@ export class TrainingService {
 
       await prisma.trainingJob.update({ where: { id: job.id }, data: { currentRound } })
 
+      const totalShard = contributions.reduce((s, c) => s + c.shardSize, 0)
+
       this.io.to(sessionId).emit('training:round_complete', {
         jobId: job.id,
         round: currentRound,
         totalRounds: numRounds,
         loss: parseFloat(avgLoss.toFixed(4)),
         accuracy: parseFloat(avgAccuracy.toFixed(4)),
-        deviceContributions: devices.map((d) => ({
-          deviceId: d.id,
-          contribution: 1 / devices.length,
-        })),
+        deviceContributions: devices.map((d, i) => {
+          const shardSize = contributions[i]?.shardSize ?? 0
+          return {
+            deviceId: d.id,
+            name: d.deviceName,
+            computeType: d.computeType,
+            os: d.os,
+            samples: shardSize,
+            shardSize,
+            contribution: totalShard > 0 ? shardSize / totalShard : 1 / devices.length,
+          }
+        }),
       })
 
       for (const device of devices) {

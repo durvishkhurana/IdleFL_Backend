@@ -258,16 +258,30 @@ export function registerTrainingHandlers(io, socket) {
         })
       )
 
+      const roundDevices = await prisma.device.findMany({
+        where: { id: { in: dedupedStore.map((e) => e.deviceId) } },
+        select: { id: true, deviceName: true, computeType: true, os: true },
+      })
+      const deviceMeta = new Map(roundDevices.map((d) => [d.id, d]))
+
       io.to(job.sessionId).emit('training:round_complete', {
         jobId,
         round: roundNum,
         totalRounds: job.numRounds,
         loss: Number(avgLoss.toFixed(4)),
         accuracy: Number(avgAccuracy.toFixed(4)),
-        deviceContributions: dedupedStore.map((entry) => ({
-          deviceId: entry.deviceId,
-          contribution: entry.shardSize / totalSamples,
-        })),
+        deviceContributions: dedupedStore.map((entry) => {
+          const meta = deviceMeta.get(entry.deviceId)
+          return {
+            deviceId: entry.deviceId,
+            name: meta?.deviceName,
+            computeType: meta?.computeType,
+            os: meta?.os,
+            samples: entry.shardSize,
+            shardSize: entry.shardSize,
+            contribution: totalSamples > 0 ? entry.shardSize / totalSamples : 0,
+          }
+        }),
       })
 
       await redis.del(REDIS_KEYS.jobWeights(jobId, roundNum))

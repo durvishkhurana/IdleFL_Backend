@@ -18,7 +18,15 @@ function stripDatasetContent(job) {
 }
 
 export const startTraining = asyncHandler(async (req, res) => {
-  const { sessionId, modelType, learningRate, numRounds, batchSize } = req.body
+  const { sessionId, modelType } = req.body
+  const learningRate = parseFloat(req.body.learningRate)
+  const numRounds = parseInt(req.body.numRounds, 10)
+  const batchSize = parseInt(req.body.batchSize, 10)
+
+  if (Number.isNaN(learningRate) || Number.isNaN(numRounds) || Number.isNaN(batchSize)) {
+    return res.status(400).json({ error: 'Invalid hyperparameters' })
+  }
+
   const file = req.file
   const demoMode = process.env.DEMO_MODE === 'true'
 

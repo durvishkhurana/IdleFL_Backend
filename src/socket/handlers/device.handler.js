@@ -15,15 +15,18 @@ export function registerDeviceHandlers(io, socket) {
         return
       }
 
+      // Pass through agent value unchanged (expected: CUDA | MPS | CPU). Default only when absent.
+      const resolvedComputeType = computeType ?? 'CPU'
+
       const device = await prisma.device.upsert({
         where: { id: socket.handshake.auth.deviceId || 'new' },
-        update: { socketId: socket.id, status: 'ACTIVE', os, computeType, lastHeartbeat: new Date() },
+        update: { socketId: socket.id, status: 'ACTIVE', os, computeType: resolvedComputeType, lastHeartbeat: new Date() },
         create: {
           sessionId: session.id,
           userId: user.id,
           deviceName: user.userId,
           os,
-          computeType,
+          computeType: resolvedComputeType,
           socketId: socket.id,
           status: 'ACTIVE',
         },
@@ -36,10 +39,10 @@ export function registerDeviceHandlers(io, socket) {
       await redis.setex(
         REDIS_KEYS.device(device.id),
         300,
-        JSON.stringify({ id: device.id, sessionId: session.id, userId: user.id, socketId: socket.id, computeType })
+        JSON.stringify({ id: device.id, sessionId: session.id, userId: user.id, socketId: socket.id, computeType: device.computeType })
       )
 
-      logger.info(`Device registered: ${user.userId} in session ${sessionCode} (${computeType})`)
+      logger.info(`Device registered: ${user.userId} in session ${sessionCode} (${device.computeType})`)
 
       socket.emit('device:registered', { deviceId: device.id, sessionId: session.id })
 
@@ -48,8 +51,8 @@ export function registerDeviceHandlers(io, socket) {
           id: device.id,
           deviceId: device.id,
           deviceName: device.deviceName,
-          os,
-          computeType,
+          os: device.os,
+          computeType: resolvedComputeType,
           status: 'ACTIVE',
           computeScore: 0.5,
         },
