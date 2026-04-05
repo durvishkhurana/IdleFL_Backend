@@ -7,7 +7,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 export const downloadScript = asyncHandler(async (req, res) => {
   const os = req.query.os || 'windows'
-  const serverUrl = process.env.CLIENT_URL?.replace('5173', '4000') || 'http://localhost:4000'
+  const serverUrl =
+    process.env.BACKEND_URL ||
+    process.env.RENDER_EXTERNAL_URL ||
+    'http://localhost:4000'
 
   const scriptName = os === 'mac' ? 'agent_mac.py' : 'agent_windows.py'
   const scriptPath = path.join(__dirname, '../../../scripts', scriptName)
