@@ -294,6 +294,9 @@ export class TrainingService {
 
       if (device.socketId) {
         const assignment = assignmentsByDeviceId.get(device.id)
+        logger.info(
+          `Round ${roundNum} dispatched — globalWeights length: ${globalWeights ? globalWeights.length : 0}`
+        )
         this.io.to(device.socketId).emit('training:task_assigned', {
           taskId: assignment.id,
           jobId,

@@ -168,49 +168,60 @@ def _train_linear_regression(data_shard, config):
     y = np.asarray(data_shard["y"], dtype=np.float64)
     num_samples, num_features = x.shape
 
+    # Z-score normalize inputs
+    x_mean = np.mean(x, axis=0)
+    x_std = np.std(x, axis=0)
+    x_std = np.where(x_std == 0, 1.0, x_std)
+    x_norm = (x - x_mean) / x_std
+
+    y_mean = np.mean(y)
+    y_std = float(np.std(y))
+    if y_std == 0:
+        y_std = 1.0
+    y_norm = (y - y_mean) / y_std
+
     learning_rate = float(_config_value(config, "learning_rate", "learningRate", DEFAULT_LEARNING_RATE))
     epochs = int(_config_value(config, "epochs", "epochs", DEFAULT_EPOCHS))
-    global_weights = _config_value(config, "global_weights", "globalWeights", None)
     task_data = config
     checkpoint_interval = int(task_data.get("checkpointInterval", 10))
 
-    # Scale learning rate based on feature magnitude to prevent explosion
-    feature_scale = np.sqrt(np.mean(x ** 2))
-    if feature_scale > 1:
-        learning_rate = learning_rate / (feature_scale ** 2)
+    # Ignore globalWeights for warm start (original-space params do not match normalized training).
+    weights = np.zeros(num_features, dtype=np.float64)
+    bias = 0.0
 
-    if global_weights and len(global_weights) == num_features + 1:
-        params = np.asarray(global_weights, dtype=np.float64)
-        weights = params[:-1].copy()
-        bias = float(params[-1])
-    else:
-        weights = np.zeros(num_features, dtype=np.float64)
-        bias = 0.0
-
-    loss = 0.0
     for iteration in range(1, epochs + 1):
-        prediction = x @ weights + bias
-        residual = prediction - y
-        loss = float(np.mean(residual ** 2))
-        grad_w = (2.0 / num_samples) * (x.T @ residual)
+        prediction = x_norm @ weights + bias
+        residual = prediction - y_norm
+        grad_w = (2.0 / num_samples) * (x_norm.T @ residual)
         grad_b = (2.0 / num_samples) * np.sum(residual)
         weights -= learning_rate * grad_w
         bias -= learning_rate * grad_b
         if checkpoint_interval > 0 and iteration % checkpoint_interval == 0:
+            weights_orig_ckpt = weights * y_std / x_std
+            bias_orig_ckpt = y_mean + bias * y_std - np.dot(weights_orig_ckpt, x_mean)
             _emit_training_checkpoint(
                 config,
-                weights.astype(float).tolist() + [float(bias)],
+                weights_orig_ckpt.astype(float).tolist() + [float(bias_orig_ckpt)],
                 iteration,
             )
 
-    prediction = x @ weights + bias
-    residual = prediction - y
-    loss = float(np.mean(residual ** 2))
-    ss_res = float(np.sum(residual ** 2))
-    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
-    accuracy = 1.0 if math.isclose(ss_tot, 0.0) else max(0.0, 1.0 - (ss_res / ss_tot))
+    # Denormalize weights back to original feature space
+    weights_orig = weights * y_std / x_std
+    bias_orig = y_mean + bias * y_std - np.dot(weights_orig, x_mean)
 
-    return {"weights": weights.astype(float).tolist() + [float(bias)], "loss": loss, "accuracy": float(accuracy)}
+    # Compute loss and accuracy in original space for reporting
+    pred_orig = x @ weights_orig + bias_orig
+    resid = pred_orig - y
+    loss = float(np.mean(resid ** 2))
+    ss_res = float(np.sum(resid ** 2))
+    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+    accuracy = max(0.0, 1.0 - ss_res / ss_tot) if not math.isclose(ss_tot, 0) else 1.0
+
+    return {
+        "weights": weights_orig.tolist() + [float(bias_orig)],
+        "loss": loss,
+        "accuracy": float(accuracy),
+    }
 
 
 def _train_logistic_regression(data_shard, config):
