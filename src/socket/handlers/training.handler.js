@@ -555,7 +555,7 @@ export async function reassignDroppedDeviceTrainingTask(io, droppedDeviceId) {
 }
 
 export function registerTrainingHandlers(io, socket) {
-  socket.on('training:weights_ready', async (payload) => {
+  socket.on('training:weights_ready', async (payload, ack) => {
     try {
       if (!socket.deviceId) {
         return
@@ -590,6 +590,26 @@ export function registerTrainingHandlers(io, socket) {
         chunkTotal > 0 &&
         Array.isArray(weightsChunk)
 
+      const ackOk = (extra = {}) => {
+        if (typeof ack === 'function') {
+          try {
+            ack({ ok: true, ...extra })
+          } catch {
+            // ignore
+          }
+        }
+      }
+
+      const ackErr = (code) => {
+        if (typeof ack === 'function') {
+          try {
+            ack({ ok: false, error: code })
+          } catch {
+            // ignore
+          }
+        }
+      }
+
       const job = await prisma.trainingJob.findUnique({
         where: { id: jobId },
         include: {
@@ -605,22 +625,26 @@ export function registerTrainingHandlers(io, socket) {
 
       if (!job) {
         logger.warn(`Ignoring weights for missing job ${jobId}`)
+        ackErr('job_not_found')
         return
       }
 
       if (job.status !== 'RUNNING') {
         logger.warn(`Ignoring weights for job ${jobId} in status ${job.status}`)
+        ackErr('job_not_running')
         return
       }
 
       if (job.currentRound !== roundNum) {
         logger.warn(`Ignoring stale weights for job ${jobId}: expected round ${job.currentRound}, received ${roundNum}`)
+        ackErr('stale_round')
         return
       }
 
       const assignment = job.taskAssignments.find((task) => task.deviceId === socket.deviceId)
       if (!assignment) {
         logger.warn(`Ignoring weights from device ${socket.deviceId}: no active assignment for round ${roundNum}`)
+        ackErr('no_assignment')
         return
       }
 
@@ -662,6 +686,7 @@ export function registerTrainingHandlers(io, socket) {
         )
 
         if (receivedCount < total) {
+          ackOk({ chunked: true, receivedCount, total })
           return
         }
 
@@ -687,6 +712,7 @@ export function registerTrainingHandlers(io, socket) {
         const dtype = String(weightsDtype || 'float32').toLowerCase()
         if (dtype !== 'float32') {
           logger.warn(`Ignoring binary weights with unsupported dtype=${dtype} from device ${socket.deviceId}`)
+          ackErr('unsupported_dtype')
           return
         }
 
@@ -698,6 +724,7 @@ export function registerTrainingHandlers(io, socket) {
           logger.warn(
             `Ignoring binary weights with invalid byteLength=${buf.byteLength} from device ${socket.deviceId}`
           )
+          ackErr('invalid_binary_length')
           return
         }
 
@@ -706,6 +733,7 @@ export function registerTrainingHandlers(io, socket) {
           logger.warn(
             `Binary weights length mismatch from device ${socket.deviceId}: expected=${weightsLen} got=${floatCount}`
           )
+          ackErr('length_mismatch')
           return
         }
 
@@ -728,6 +756,7 @@ export function registerTrainingHandlers(io, socket) {
       } else {
         if (!Array.isArray(weights) || weights.length === 0) {
           logger.warn(`Ignoring empty weights from device ${socket.deviceId} for job ${jobId} round ${roundNum}`)
+          ackErr('empty_weights')
           return
         }
         dedupedStore.push({
@@ -761,6 +790,7 @@ export function registerTrainingHandlers(io, socket) {
       await redis.del(REDIS_KEYS.deviceTask(socket.deviceId))
 
       io.to(job.sessionId).emit('device:status_update', { deviceId: socket.deviceId, status: 'ACTIVE' })
+      ackOk({ stored: true, weightsLen: Array.isArray(weights) ? weights.length : 0 })
 
       const totalAssigned = job.taskAssignments.length
       const existing = roundState.get(jobId)
@@ -837,6 +867,13 @@ export function registerTrainingHandlers(io, socket) {
       await checkRoundCompletion(io, jobId, roundNum)
     } catch (error) {
       logger.error('training:weights_ready error:', error)
+      if (typeof ack === 'function') {
+        try {
+          ack({ ok: false, error: 'server_error' })
+        } catch {
+          // ignore
+        }
+      }
     }
   })
 

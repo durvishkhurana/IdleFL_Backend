@@ -1043,19 +1043,34 @@ async def run_agent():
         if model_type == "CNN" and len(weights_out) > 0 and CNN_UPLOAD_MODE == "bin":
             # One-shot binary upload (Float32) — much faster than JSON chunks.
             arr = np.asarray(weights_out, dtype=np.float32)
-            await sio.emit(
-                "training:weights_ready",
-                {
-                    "jobId": job_id,
-                    "roundNum": round_num,
-                    "weightsBin": arr.tobytes(order="C"),
-                    "weightsDtype": "float32",
-                    "weightsLen": int(arr.size),
-                    "loss": result.get("loss"),
-                    "accuracy": result.get("accuracy"),
-                },
-            )
-            print(f"[✓] Weights sent (binary: {arr.nbytes} bytes)")
+            payload = {
+                "jobId": job_id,
+                "roundNum": round_num,
+                "weightsBin": arr.tobytes(order="C"),
+                "weightsDtype": "float32",
+                "weightsLen": int(arr.size),
+                "loss": result.get("loss"),
+                "accuracy": result.get("accuracy"),
+            }
+            # Use ack so we *know* the server stored it. If disconnected mid-upload, retry once.
+            try:
+                resp = await sio.call("training:weights_ready", payload, timeout=60.0)
+                if not (resp or {}).get("ok", False):
+                    raise RuntimeError(f"server_nack: {resp}")
+                print(f"[✓] Weights accepted by server (binary: {arr.nbytes} bytes)")
+            except Exception as e:
+                print(f"[⚠] Weights upload did not ack ({e}) — waiting for reconnect then retrying once")
+                # Wait until reconnected (max 30s)
+                deadline = time.time() + 30.0
+                while (not sio.connected) and time.time() < deadline:
+                    await asyncio.sleep(0.25)
+                if sio.connected:
+                    resp = await sio.call("training:weights_ready", payload, timeout=60.0)
+                    if not (resp or {}).get("ok", False):
+                        raise RuntimeError(f"server_nack: {resp}")
+                    print(f"[✓] Weights accepted by server after retry (binary: {arr.nbytes} bytes)")
+                else:
+                    print("[✗] Could not reconnect to retry weights upload")
         elif model_type == "CNN" and len(weights_out) > 0:
             # Larger chunks = fewer emits = much faster (JSON overhead dominates).
             # Tune via env var without editing the script.
