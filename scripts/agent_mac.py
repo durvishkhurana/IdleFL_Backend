@@ -227,16 +227,8 @@ def _train_linear_regression(data_shard, config, mu):
     if num_samples < 200:
         epochs = min(epochs * 5, 50)
 
-    # Safe learning rate scaling.
-    # The learning rate is user-controlled (range 0.0001–1). Because y is kept in original
-    # space, gradient magnitudes scale with y values. A user setting lr=0.3 on a dataset
-    # where y ranges in the hundreds would cause gradient explosion without this scaling.
-    # We scale by 1/y_std so the effective step size is always appropriate regardless of
-    # y magnitude or what the user picked.
-    y_scale = float(np.std(y))
-    if y_scale < 1.0:
-        y_scale = 1.0
-    effective_lr = learning_rate / y_scale
+    # Use the learning rate as-is (no shard-size scaling).
+    effective_lr = learning_rate
 
     print(f"[DEBUG] epochs={epochs}, num_samples={num_samples}, lr={learning_rate}, effective_lr={effective_lr:.6f}")
 
