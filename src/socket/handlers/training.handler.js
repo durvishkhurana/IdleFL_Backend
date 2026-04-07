@@ -4,6 +4,7 @@ import { prisma } from '../../config/database.js'
 import { redis, REDIS_KEYS } from '../../config/redis.js'
 import { computeWeightedRoundMetrics, fedAvgAggregate } from '../../modules/training/fedavg.js'
 import { getTrainingService, emitTrainingTaskAssigned } from '../../modules/training/training.service.js'
+import { PARTICIPATION_THRESHOLD, ROUND_TIMEOUT_SECONDS } from '../../modules/training/training.constants.js'
 import { filterEligibleDevices } from '../../utils/deviceScoring.js'
 import { getShardPayload } from '../../utils/dataPartitioner.js'
 import { logger } from '../../config/logger.js'
@@ -13,6 +14,9 @@ const CHECKPOINT_TTL_SECONDS = 7200
 const EVAL_WAIT_MS = 15_000
 const EVAL_POLL_MS = 200
 const AGG_LOCK_TTL_SECONDS = 120
+
+const roundState = new Map()
+// Key: jobId, Value: { roundNum: number, submitted: string[], totalAssigned: number, timer: any }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -63,7 +67,7 @@ async function saveModelArtifact({ jobId, modelType, globalWeights, finalAccurac
 /**
  * After all assignments for the round are completed, aggregate weights, global eval, persist round, advance job.
  */
-async function finalizeAggregatedRound(io, jobId, roundNum) {
+async function finalizeAggregatedRound(io, jobId, roundNum, opts = {}) {
   const lockKey = REDIS_KEYS.jobRoundAggLock(jobId, roundNum)
   const locked = await redis.set(lockKey, '1', 'EX', AGG_LOCK_TTL_SECONDS, 'NX')
   if (!locked) {
@@ -77,11 +81,57 @@ async function finalizeAggregatedRound(io, jobId, roundNum) {
       return
     }
 
-    const inProgress = await prisma.taskAssignment.count({
-      where: { jobId, roundNum, status: 'IN_PROGRESS' },
-    })
-    if (inProgress > 0) {
-      return
+    if (!opts.allowEarly) {
+      const inProgress = await prisma.taskAssignment.count({
+        where: { jobId, roundNum, status: 'IN_PROGRESS' },
+      })
+      if (inProgress > 0) {
+        return
+      }
+    } else {
+      // Async aggregation: skip stragglers for this round only (do NOT mark DROPPED).
+      const inProgressAssignments = await prisma.taskAssignment.findMany({
+        where: { jobId, roundNum, status: 'IN_PROGRESS' },
+        select: { id: true, deviceId: true, shardSize: true },
+      })
+      if (inProgressAssignments.length > 0) {
+        logger.info(
+          `Async aggregation firing for job ${jobId} round ${roundNum}: skipping ${inProgressAssignments.length} stragglers (threshold/timeout)`
+        )
+
+        const store = await getRoundContributions(jobId, roundNum)
+        const seen = new Set(store.map((e) => e.deviceId))
+        for (const a of inProgressAssignments) {
+          if (!seen.has(a.deviceId)) {
+            store.push({ deviceId: a.deviceId, skipped: true, shardSize: a.shardSize })
+          }
+        }
+        await saveRoundContributions(jobId, roundNum, store)
+
+        const ids = inProgressAssignments.map((a) => a.id)
+        const deviceIds = inProgressAssignments.map((a) => a.deviceId)
+
+        await prisma.taskAssignment.updateMany({
+          where: { id: { in: ids } },
+          data: { status: 'COMPLETED', completedAt: new Date() },
+        })
+
+        await prisma.device.updateMany({
+          where: { id: { in: deviceIds } },
+          data: { status: 'ACTIVE', activeTasks: 0 },
+        })
+
+        for (const deviceId of deviceIds) {
+          const redisDevice = await redis.get(REDIS_KEYS.device(deviceId))
+          const cachedDevice = redisDevice ? JSON.parse(redisDevice) : {}
+          await redis.setex(
+            REDIS_KEYS.device(deviceId),
+            300,
+            JSON.stringify({ ...cachedDevice, id: deviceId, status: 'ACTIVE' })
+          )
+          await redis.del(REDIS_KEYS.deviceTask(deviceId))
+        }
+      }
     }
 
     const job = await prisma.trainingJob.findUnique({
@@ -204,12 +254,21 @@ async function finalizeAggregatedRound(io, jobId, roundNum) {
     })
     const deviceMeta = new Map(roundDevices.map((d) => [d.id, d]))
 
+    const assignedDevices =
+      typeof opts.assignedDevices === 'number'
+        ? opts.assignedDevices
+        : await prisma.taskAssignment.count({ where: { jobId, roundNum } })
+    const participatingDevices =
+      typeof opts.participatingDevices === 'number' ? opts.participatingDevices : aggregateWeights.length
+
     io.to(job.sessionId).emit('training:round_complete', {
       jobId,
       round: roundNum,
       totalRounds: job.numRounds,
       loss: Number(avgLoss.toFixed(4)),
       accuracy: Number(avgAccuracy.toFixed(4)),
+      participatingDevices,
+      assignedDevices,
       deviceContributions: aggregateWeights.map((entry) => {
         const meta = deviceMeta.get(entry.deviceId)
         return {
@@ -298,6 +357,19 @@ async function dispatchNextRound({ io, job, nextRound, globalWeights }) {
 
   io.to(job.sessionId).emit('training:global_model', { jobId: job.id, roundNum: nextRound - 1, globalWeights })
 
+  let mu = 0.01
+  const stateRaw = await redis.get(REDIS_KEYS.jobState(job.id))
+  if (stateRaw) {
+    try {
+      const parsed = JSON.parse(stateRaw)
+      if (Number.isFinite(Number(parsed?.mu))) {
+        mu = Number(parsed.mu)
+      }
+    } catch {
+      // ignore
+    }
+  }
+
   await trainingService.dispatchRound({
     jobId: job.id,
     sessionId: job.sessionId,
@@ -306,6 +378,7 @@ async function dispatchNextRound({ io, job, nextRound, globalWeights }) {
     totalRows: job.totalRows,
     learningRate: job.learningRate,
     batchSize: job.batchSize,
+    mu,
     roundNum: nextRound,
     globalWeights,
     devices: eligibleDevices,
@@ -418,6 +491,19 @@ export async function reassignDroppedDeviceTrainingTask(io, droppedDeviceId) {
       }
     }
 
+    let mu = 0.01
+    const stateRaw = await redis.get(REDIS_KEYS.jobState(activeTask.jobId))
+    if (stateRaw) {
+      try {
+        const parsed = JSON.parse(stateRaw)
+        if (Number.isFinite(Number(parsed?.mu))) {
+          mu = Number(parsed.mu)
+        }
+      } catch {
+        // ignore
+      }
+    }
+
     if (bestDevice.socketId) {
       emitTrainingTaskAssigned(io, {
         device: bestDevice,
@@ -428,6 +514,7 @@ export async function reassignDroppedDeviceTrainingTask(io, droppedDeviceId) {
         modelType: activeTask.job.modelType,
         learningRate: activeTask.job.learningRate,
         batchSize: activeTask.job.batchSize,
+        mu,
         globalWeights,
         checkpointPath: activeTask.checkpointPath,
       })
@@ -536,6 +623,68 @@ export function registerTrainingHandlers(io, socket) {
       await redis.del(REDIS_KEYS.deviceTask(socket.deviceId))
 
       io.to(job.sessionId).emit('device:status_update', { deviceId: socket.deviceId, status: 'ACTIVE' })
+
+      const totalAssigned = job.taskAssignments.length
+      const existing = roundState.get(jobId)
+      const isSameRound = existing && existing.roundNum === roundNum
+      const state =
+        isSameRound && existing
+          ? existing
+          : { roundNum, submitted: [], totalAssigned, timer: null }
+
+      if (!isSameRound) {
+        if (existing?.timer) {
+          clearTimeout(existing.timer)
+        }
+        roundState.set(jobId, state)
+      }
+
+      if (!state.submitted.includes(socket.deviceId)) {
+        state.submitted.push(socket.deviceId)
+      }
+
+      // Start timeout when first contribution arrives for the round.
+      if (!state.timer) {
+        state.timer = setTimeout(async () => {
+          try {
+            const st = roundState.get(jobId)
+            if (st && st.roundNum === roundNum && st.submitted.length > 0) {
+              logger.info(
+                `Round ${roundNum} job ${jobId}: ROUND_TIMEOUT_SECONDS fired (${ROUND_TIMEOUT_SECONDS}s) — aggregating with ${st.submitted.length}/${st.totalAssigned}`
+              )
+              await finalizeAggregatedRound(io, jobId, roundNum, {
+                allowEarly: true,
+                participatingDevices: st.submitted.length,
+                assignedDevices: st.totalAssigned,
+              })
+              roundState.delete(jobId)
+            }
+          } catch (e) {
+            logger.error(`Round ${roundNum} job ${jobId}: timeout aggregation error:`, e)
+          }
+        }, ROUND_TIMEOUT_SECONDS * 1000)
+
+        logger.info(
+          `Round ${roundNum} job ${jobId}: started aggregation timeout timer (${ROUND_TIMEOUT_SECONDS}s); threshold=${PARTICIPATION_THRESHOLD}`
+        )
+      }
+
+      const needed = Math.ceil(state.totalAssigned * PARTICIPATION_THRESHOLD)
+      if (state.submitted.length >= needed) {
+        logger.info(
+          `Round ${roundNum} job ${jobId}: participation threshold reached (${state.submitted.length}/${state.totalAssigned} >= ${needed}) — aggregating`
+        )
+        if (state.timer) {
+          clearTimeout(state.timer)
+        }
+        await finalizeAggregatedRound(io, jobId, roundNum, {
+          allowEarly: true,
+          participatingDevices: state.submitted.length,
+          assignedDevices: state.totalAssigned,
+        })
+        roundState.delete(jobId)
+        return
+      }
 
       const inProgress = await prisma.taskAssignment.count({
         where: { jobId, roundNum, status: 'IN_PROGRESS' },

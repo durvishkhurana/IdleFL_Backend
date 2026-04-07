@@ -5,8 +5,18 @@
 
 export const SCORE_THRESHOLD = 0.3
 
-export function scoreDevice({ cpuPercent, freeRamGb, totalRamGb, reliabilityScore, activeTasks, computeType }) {
+export function scoreDevice({
+  cpuPercent,
+  freeRamGb,
+  totalRamGb,
+  reliabilityScore,
+  activeTasks,
+  computeType,
+  gpuVramTotal,
+  gpuVramUsed,
+}) {
   const w1 = 0.25, w2 = 0.25, w3 = 0.25, w4 = 0.25
+  const w5 = 0.20, w6 = 0.10
 
   const cpuNorm = cpuPercent / 100
   const ramNorm = totalRamGb > 0 ? freeRamGb / totalRamGb : 0
@@ -17,6 +27,19 @@ export function scoreDevice({ cpuPercent, freeRamGb, totalRamGb, reliabilityScor
   // GPU bonus: CUDA = +0.15, MPS = +0.10
   if (computeType === 'CUDA') score += 0.15
   if (computeType === 'MPS') score += 0.10
+
+  // GPU weighting: higher score → larger shard assigned by dataPartitioner
+  // → GPU device processes more data per round → round time dominated
+  // by fast device not CPU stragglers. w5+w6 intentionally outweigh
+  // CPU/RAM factors for CUDA devices to maximize hardware utilization.
+  // Reference: v2 improvement over IEEE IATMSI-2026 paper (v1 lacked GPU weighting)
+  const hasGPU = computeType === 'CUDA' || computeType === 'MPS' ? 1.0 : 0
+  const freeVRAMRatioRaw =
+    gpuVramTotal && gpuVramTotal > 0
+      ? (Number(gpuVramTotal) - Number(gpuVramUsed || 0)) / Number(gpuVramTotal)
+      : 0
+  const freeVRAMRatio = Math.max(0, Math.min(1, freeVRAMRatioRaw))
+  score += w5 * hasGPU + w6 * freeVRAMRatio
 
   return Math.max(0, Math.min(1, score))
 }

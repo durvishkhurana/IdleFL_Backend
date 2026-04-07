@@ -25,6 +25,7 @@ export function emitTrainingTaskAssigned(io, opts) {
     batchSize,
     globalWeights,
     checkpointPath,
+    mu,
   } = opts
 
   if (!device?.socketId) {
@@ -49,6 +50,8 @@ export function emitTrainingTaskAssigned(io, opts) {
       batchSize,
       epochs,
       globalWeights,
+      mu: mu ?? 0.01,
+      proximal_mu: mu ?? 0.01,
       checkpointInterval: appConfig.checkpointInterval,
       learning_rate: learningRate,
       batch_size: batchSize,
@@ -72,6 +75,7 @@ export class TrainingService {
     learningRate,
     numRounds,
     batchSize,
+    mu,
     datasetPath,
     totalRows,
     numFeatures,
@@ -82,8 +86,14 @@ export class TrainingService {
     const parsedLearningRate = parseFloat(learningRate)
     const parsedNumRounds = parseInt(numRounds, 10)
     const parsedBatchSize = parseInt(batchSize, 10)
+    const parsedMu = parseFloat(mu ?? 0.01)
 
-    if (Number.isNaN(parsedLearningRate) || Number.isNaN(parsedNumRounds) || Number.isNaN(parsedBatchSize)) {
+    if (
+      Number.isNaN(parsedLearningRate) ||
+      Number.isNaN(parsedNumRounds) ||
+      Number.isNaN(parsedBatchSize) ||
+      Number.isNaN(parsedMu)
+    ) {
       throw Object.assign(new Error('Invalid hyperparameters'), { status: 400 })
     }
 
@@ -130,6 +140,7 @@ export class TrainingService {
         modelType,
         sessionId,
         datasetPath: job.datasetPath,
+        mu: parsedMu,
       })
     )
 
@@ -143,6 +154,7 @@ export class TrainingService {
       totalRows: job.totalRows,
       learningRate: parsedLearningRate,
       batchSize: parsedBatchSize,
+      mu: parsedMu,
       roundNum: 1,
       globalWeights: null,
       devices: eligible,
@@ -154,9 +166,10 @@ export class TrainingService {
       learningRate: parsedLearningRate,
       numRounds: parsedNumRounds,
       batchSize: parsedBatchSize,
+      mu: parsedMu,
     })
 
-    logger.info(`Training started: job ${job.id}, session ${sessionId}, ${eligible.length} devices`)
+    logger.info(`Training started: job ${job.id}, session ${sessionId}, ${eligible.length} devices (mu=${parsedMu})`)
 
     return { job, eligibleDevices: eligible.length }
   }
@@ -196,7 +209,19 @@ export class TrainingService {
    * @param {string | null | undefined} opts.datasetPath
    * @param {number | null | undefined} opts.totalRows
    */
-  async dispatchRound({ jobId, sessionId, modelType, datasetPath, totalRows, learningRate, batchSize, roundNum, globalWeights, devices }) {
+  async dispatchRound({
+    jobId,
+    sessionId,
+    modelType,
+    datasetPath,
+    totalRows,
+    learningRate,
+    batchSize,
+    mu,
+    roundNum,
+    globalWeights,
+    devices,
+  }) {
     const shards = await partitionDataset({ datasetPath, totalRows, devices, modelType })
     const activeDevices = devices.filter((device) => shards.some((shard) => shard.deviceId === device.id))
 
@@ -242,6 +267,7 @@ export class TrainingService {
         sessionId,
         modelType,
         datasetPath,
+        mu: Number.isFinite(Number(mu)) ? Number(mu) : 0.01,
       })
     )
     await redis.setex(REDIS_KEYS.jobRound(jobId), 3600, String(roundNum))
@@ -285,6 +311,7 @@ export class TrainingService {
           modelType,
           learningRate,
           batchSize,
+          mu,
           globalWeights,
           checkpointPath: assignment.checkpointPath,
         })

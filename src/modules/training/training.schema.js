@@ -18,6 +18,7 @@ export const createJobMultipartSchema = z.object({
     learningRate: z.coerce.number().min(0.0001).max(1).optional(),
     numRounds: z.coerce.number().int().min(1).max(100).optional(),
     batchSize: z.coerce.number().int().min(1).max(1024).optional(),
+    mu: z.coerce.number().min(0).max(1).optional(),
   }),
 })
 

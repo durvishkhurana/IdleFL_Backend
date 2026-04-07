@@ -197,7 +197,7 @@ def _softmax(values):
     return exp_values / np.sum(exp_values, axis=1, keepdims=True)
 
 
-def _train_linear_regression(data_shard, config):
+def _train_linear_regression(data_shard, config, mu):
     """Trains linear regression with x-only normalization for cross-device FedAvg consistency."""
     x = np.asarray(data_shard["X"], dtype=np.float64)
     y = np.asarray(data_shard["y"], dtype=np.float64)
@@ -272,6 +272,17 @@ def _train_linear_regression(data_shard, config):
         grad_w = np.clip(grad_w, -10.0, 10.0)
         grad_b = float(np.clip(grad_b, -10.0, 10.0))
 
+        # FedProx proximal term — prevents local drift from global model
+        # Li et al. 2020: minimize loss + (mu/2)||w - w_global||²
+        if mu > 0 and global_weights is not None and len(global_weights) == num_features + 1:
+            w_g = np.asarray(global_weights[:-1], dtype=np.float64)
+            b_g = float(global_weights[-1])
+            # convert global weights to normalized space (same space as local weights)
+            w_g_norm = w_g * x_std
+            b_g_norm = b_g + float(np.dot(w_g, x_mean))
+            grad_w += mu * (weights - w_g_norm)
+            grad_b += mu * float(bias - b_g_norm)
+
         # Use effective_lr (scaled by y_std) for weights, raw learning_rate for bias.
         # Bias gradient is already in y-units so user lr applies correctly there.
         weights -= effective_lr * grad_w
@@ -311,7 +322,7 @@ def _train_linear_regression(data_shard, config):
     }
 
 
-def _train_logistic_regression(data_shard, config):
+def _train_logistic_regression(data_shard, config, mu):
     """Trains binary or multiclass logistic regression using SGD mini-batches on z-scored features."""
     x = np.asarray(data_shard["X"], dtype=np.float64)
     y = np.asarray(data_shard["y"])
@@ -357,6 +368,13 @@ def _train_logistic_regression(data_shard, config):
                 error = prediction - y_batch
                 grad_w = (x_batch.T @ error) / len(batch_idx)
                 grad_b = float(np.mean(error))
+                if mu > 0 and global_weights is not None and len(global_weights) == num_features + 1:
+                    w_g = np.asarray(global_weights[:-1], dtype=np.float64)
+                    b_g = float(global_weights[-1])
+                    w_g_norm = w_g * x_std
+                    b_g_norm = b_g + float(np.dot(w_g, x_mean))
+                    grad_w += mu * (weights - w_g_norm)
+                    grad_b += mu * float(bias - b_g_norm)
                 weights -= learning_rate * grad_w
                 bias -= learning_rate * grad_b
                 if checkpoint_interval > 0 and iteration % checkpoint_interval == 0:
@@ -411,6 +429,14 @@ def _train_logistic_regression(data_shard, config):
             error = probabilities - targets
             grad_w = (x_batch.T @ error) / len(batch_idx)
             grad_b = np.mean(error, axis=0)
+            if mu > 0 and global_weights is not None and len(global_weights) == expected_len:
+                params_g = np.asarray(global_weights, dtype=np.float64)
+                w_g = params_g[:num_features*num_classes].reshape(num_features, num_classes)
+                b_g = params_g[num_features*num_classes:]
+                w_g_norm = w_g * x_std[:, np.newaxis]
+                b_g_norm = b_g + np.dot(x_mean, w_g)
+                grad_w += mu * (weights - w_g_norm)
+                grad_b += mu * (bias - b_g_norm)
             weights -= learning_rate * grad_w
             bias -= learning_rate * grad_b
             if checkpoint_interval > 0 and iteration % checkpoint_interval == 0:
@@ -450,7 +476,7 @@ def _load_cnn_dependencies():
         raise error
 
 
-def _train_cnn(data_shard, config):
+def _train_cnn(data_shard, config, mu):
     """Trains the small IdleFL CNN on the assigned MNIST or CIFAR-10 subset."""
     torch, nn, f, torchvision, DataLoader, Subset, transforms = _load_cnn_dependencies()
 
@@ -538,6 +564,22 @@ def _train_cnn(data_shard, config):
             logits = model(batch_x)
             loss = criterion(logits, batch_y)
             loss.backward()
+            # FedProx proximal regularization (Li et al. 2020)
+            if mu > 0 and global_weights is not None:
+                try:
+                    global_flat = torch.tensor(
+                        global_weights, dtype=torch.float32, device=device
+                    )
+                    current_flat = torch.cat(
+                        [p.data.view(-1) for p in model.parameters()]
+                    )
+                    if global_flat.shape == current_flat.shape:
+                        prox_term = (mu / 2.0) * torch.sum(
+                            (current_flat - global_flat) ** 2
+                        )
+                        prox_term.backward()
+                except Exception as _prox_err:
+                    pass  # proximal term is optional — never crash training
             optimizer.step()
             last_loss = float(loss.item())
             if checkpoint_interval > 0 and iteration % checkpoint_interval == 0:
@@ -698,7 +740,7 @@ def run_global_eval(model_type, data_shard, global_weights):
     return 0.0, 0.0
 
 
-def train_locally(model_type, data_shard, config):
+def train_locally(model_type, data_shard, config, mu):
     """
     Trains a local model on the assigned shard and returns flattened weights.
 
@@ -718,11 +760,11 @@ def train_locally(model_type, data_shard, config):
 
     try:
         if model_type == "LINEAR_REGRESSION":
-            result = _train_linear_regression(data_shard, config)
+            result = _train_linear_regression(data_shard, config, mu)
         elif model_type == "LOGISTIC_REGRESSION":
-            result = _train_logistic_regression(data_shard, config)
+            result = _train_logistic_regression(data_shard, config, mu)
         elif model_type == "CNN":
-            result = _train_cnn(data_shard, config)
+            result = _train_cnn(data_shard, config, mu)
         else:
             raise ValueError(f"Unsupported model type: {model_type}")
 
@@ -869,6 +911,8 @@ async def run_agent():
         config["_main_loop"] = asyncio.get_running_loop()
         shard = data.get("shard") or {}
 
+        mu = float(_config_value(config, "proximal_mu", "mu", 0.0))
+
         # Priority 1: use weights pre-loaded by server-push training:checkpoint_fetch (check 5 & 6).
         server_weights = _pending_checkpoints.pop(task_id, None) if task_id else None
         if server_weights:
@@ -930,7 +974,7 @@ async def run_agent():
         _LAST_LOCAL_SHARD[job_id] = shard
 
         print(f"\n[●] Round {round_num} - training {model_type}...")
-        result = await asyncio.to_thread(train_locally, model_type, shard, config)
+        result = await asyncio.to_thread(train_locally, model_type, shard, config, mu)
         print(f"[●] Sending weights ({len(result['weights'])} floats)...")
 
         await sio.emit("training:weights_ready", {

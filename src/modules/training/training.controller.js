@@ -18,6 +18,7 @@ export const startTraining = asyncHandler(async (req, res) => {
   const learningRate = parseFloat(req.body.learningRate)
   const numRounds = parseInt(req.body.numRounds, 10)
   const batchSize = parseInt(req.body.batchSize, 10)
+  const mu = parseFloat(req.body.mu) || 0.01
 
   if (Number.isNaN(learningRate) || Number.isNaN(numRounds) || Number.isNaN(batchSize)) {
     return res.status(400).json({ error: 'Invalid hyperparameters' })
@@ -70,6 +71,7 @@ export const startTraining = asyncHandler(async (req, res) => {
     learningRate,
     numRounds,
     batchSize,
+    mu,
     datasetPath,
     totalRows,
     numFeatures,
