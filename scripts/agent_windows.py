@@ -1065,10 +1065,13 @@ async def run_agent():
                 while (not sio.connected) and time.time() < deadline:
                     await asyncio.sleep(0.25)
                 if sio.connected:
-                    resp = await sio.call("training:weights_ready", payload, timeout=60.0)
-                    if not (resp or {}).get("ok", False):
-                        raise RuntimeError(f"server_nack: {resp}")
-                    print(f"[✓] Weights accepted by server after retry (binary: {arr.nbytes} bytes)")
+                    try:
+                        resp = await sio.call("training:weights_ready", payload, timeout=60.0)
+                        if not (resp or {}).get("ok", False):
+                            raise RuntimeError(f"server_nack: {resp}")
+                        print(f"[✓] Weights accepted by server after retry (binary: {arr.nbytes} bytes)")
+                    except Exception as e2:
+                        print(f"[✗] Retry upload failed ({e2}) — giving up this round")
                 else:
                     print("[✗] Could not reconnect to retry weights upload")
         elif model_type == "CNN" and len(weights_out) > 0:

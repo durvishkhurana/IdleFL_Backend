@@ -557,7 +557,28 @@ export async function reassignDroppedDeviceTrainingTask(io, droppedDeviceId) {
 export function registerTrainingHandlers(io, socket) {
   socket.on('training:weights_ready', async (payload, ack) => {
     try {
+      const ackErr = (code) => {
+        if (typeof ack === 'function') {
+          try {
+            ack({ ok: false, error: code })
+          } catch {
+            // ignore
+          }
+        }
+      }
+
+      const ackOk = (extra = {}) => {
+        if (typeof ack === 'function') {
+          try {
+            ack({ ok: true, ...extra })
+          } catch {
+            // ignore
+          }
+        }
+      }
+
       if (!socket.deviceId) {
+        ackErr('not_registered')
         return
       }
 
@@ -589,26 +610,6 @@ export function registerTrainingHandlers(io, socket) {
         Number.isInteger(chunkTotal) &&
         chunkTotal > 0 &&
         Array.isArray(weightsChunk)
-
-      const ackOk = (extra = {}) => {
-        if (typeof ack === 'function') {
-          try {
-            ack({ ok: true, ...extra })
-          } catch {
-            // ignore
-          }
-        }
-      }
-
-      const ackErr = (code) => {
-        if (typeof ack === 'function') {
-          try {
-            ack({ ok: false, error: code })
-          } catch {
-            // ignore
-          }
-        }
-      }
 
       const job = await prisma.trainingJob.findUnique({
         where: { id: jobId },
