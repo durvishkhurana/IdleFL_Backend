@@ -1,10 +1,7 @@
-
 import { createReadStream } from 'fs'
 import { access } from 'fs/promises'
 import { constants as fsConstants } from 'fs'
-import { createHash } from 'crypto'
 import { asyncHandler } from '../../utils/asyncHandler.js'
-import { extractTabularTrainingMetadata } from '../../utils/dataPartitioner.js'
 
 // TrainingService is instantiated with the io instance in server.js, injected here
 let trainingService
@@ -24,45 +21,22 @@ export const startTraining = asyncHandler(async (req, res) => {
     return res.status(400).json({ error: 'Invalid hyperparameters' })
   }
 
-  const file = req.file
-
-  let datasetPath = null
-  let totalRows = null
-  let numFeatures = null
-  let columnNames = null
-  let datasetHash = null
+  // v2 privacy: CSV file is never uploaded. Frontend sends extracted metadata only.
+  const datasetPath = req.body.datasetPath ?? null
+  const totalRows = req.body.totalRows ?? null
+  const numFeatures = req.body.numFeatures ?? null
+  const columnNames = req.body.columnNames ?? null
+  const datasetHash = req.body.datasetHash ?? null
 
   if (modelType === 'LINEAR_REGRESSION' || modelType === 'LOGISTIC_REGRESSION') {
-    if (!file) {
-      return res.status(400).json({ error: 'CSV dataset file is required for this model type' })
+    if (!totalRows || !numFeatures || !columnNames) {
+      return res.status(400).json({ error: 'CSV metadata is required for this model type (totalRows, numFeatures, columnNames)' })
     }
-    const ext = file.originalname.toLowerCase().endsWith('.csv')
-    if (!ext) {
-      return res.status(400).json({ error: 'A .csv file is required for tabular models' })
-    }
-    let meta
-    try {
-      const csvText = file.buffer.toString('utf8')
-      meta = extractTabularTrainingMetadata(csvText)
-    } catch (error) {
-      return res.status(400).json({
-        error: error?.message || 'Malformed CSV dataset',
-      })
-    }
-
-    totalRows = meta.totalRows
-    numFeatures = meta.numFeatures
-    columnNames = meta.columnNames
-    datasetHash = createHash('sha256').update(file.buffer).digest('hex')
   } else if (modelType === 'CNN') {
-    if (!file) {
-      return res.status(400).json({ error: 'ZIP dataset file is required for CNN' })
+    // Frontend hardcodes MNIST metadata and sets datasetPath='mnist.zip'
+    if (!datasetPath) {
+      return res.status(400).json({ error: 'datasetPath is required for CNN (e.g. mnist.zip)' })
     }
-    if (!file.originalname.toLowerCase().endsWith('.zip')) {
-      return res.status(400).json({ error: 'A .zip file is required for CNN' })
-    }
-    datasetPath = file.originalname
-    datasetHash = createHash('sha256').update(file.buffer).digest('hex')
   }
 
   const result = await trainingService.startTraining({
