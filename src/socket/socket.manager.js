@@ -39,6 +39,19 @@ export function createSocketServer(httpServer) {
 
     // Coordinator joins their session room (from frontend)
     socket.on('join:session', async (sessionId) => {
+      // Idempotency: some clients emit join twice (or on reconnect).
+      // Avoid duplicate logs and redundant room joins.
+      if (!sessionId || typeof sessionId !== 'string') {
+        return
+      }
+      if (socket.sessionId === sessionId) {
+        return
+      }
+      if (socket.rooms?.has?.(sessionId)) {
+        socket.sessionId = sessionId
+        return
+      }
+
       socket.join(sessionId)
       socket.sessionId = sessionId
       const session = await prisma.session.findUnique({
