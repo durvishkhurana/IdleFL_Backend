@@ -2,6 +2,7 @@ import { prisma } from '../../config/database.js'
 import { redis, REDIS_KEYS } from '../../config/redis.js'
 import { scoreDevice } from '../../utils/deviceScoring.js'
 import { logger } from '../../config/logger.js'
+import { reassignDroppedDeviceTrainingTask } from './training.handler.js'
 
 export function registerDeviceHandlers(io, socket) {
   const { user } = socket
@@ -106,6 +107,8 @@ export function registerDeviceHandlers(io, socket) {
     if (!socket.deviceId) return
 
     try {
+      await reassignDroppedDeviceTrainingTask(io, socket.deviceId)
+
       await prisma.device.update({
         where: { id: socket.deviceId },
         data: { status: 'DISCONNECTED', socketId: null },

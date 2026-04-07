@@ -102,8 +102,11 @@ model TrainingJob {
 
   // File paths
   datasetPath String?
-  // Raw CSV text for tabular models (LINEAR / LOGISTIC); CNN uses datasetPath as upload filename hint only
-  datasetContent String? @db.Text
+  // Tabular: metadata only (raw CSV stays on device). CNN: upload filename hint.
+  totalRows    Int?
+  numFeatures  Int?
+  columnNames  String? @db.Text
+  datasetHash  String?
   modelPath   String?
 
   // Timing

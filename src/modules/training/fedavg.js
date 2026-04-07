@@ -12,6 +12,23 @@
  * SGD weights aggregate cleanly with this formula.
  */
 
+/**
+ * Shard-size–weighted mean of per-device loss and accuracy.
+ *
+ * @param {Array<{ shardSize?: number, loss?: number, accuracy?: number }>} contributions
+ * @returns {{ avgLoss: number, avgAccuracy: number }}
+ */
+export function computeWeightedRoundMetrics(contributions) {
+  const totalSamples = contributions.reduce((sum, c) => sum + (c.shardSize || 0), 0)
+  if (totalSamples === 0) {
+    return { avgLoss: 0, avgAccuracy: 0 }
+  }
+  const avgLoss = contributions.reduce((sum, c) => sum + (Number(c.loss) || 0) * (c.shardSize || 0), 0) / totalSamples
+  const avgAccuracy =
+    contributions.reduce((sum, c) => sum + (Number(c.accuracy) || 0) * (c.shardSize || 0), 0) / totalSamples
+  return { avgLoss, avgAccuracy }
+}
+
 export function fedAvgAggregate(weightContributions) {
   // weightContributions: Array of { weights: number[], shardSize: number, deviceId: string }
   if (!weightContributions || weightContributions.length === 0) {

@@ -2,34 +2,25 @@ import { mkdir, writeFile } from 'fs/promises'
 import path from 'path'
 import { prisma } from '../../config/database.js'
 import { redis, REDIS_KEYS } from '../../config/redis.js'
-import { fedAvgAggregate } from '../../modules/training/fedavg.js'
-import { getTrainingService } from '../../modules/training/training.service.js'
+import { computeWeightedRoundMetrics, fedAvgAggregate } from '../../modules/training/fedavg.js'
+import { getTrainingService, emitTrainingTaskAssigned } from '../../modules/training/training.service.js'
 import { filterEligibleDevices } from '../../utils/deviceScoring.js'
+import { getShardPayload } from '../../utils/dataPartitioner.js'
 import { logger } from '../../config/logger.js'
 
 const ROUND_CACHE_TTL_SECONDS = 3600
 const CHECKPOINT_TTL_SECONDS = 7200
+const EVAL_WAIT_MS = 15_000
+const EVAL_POLL_MS = 200
+const AGG_LOCK_TTL_SECONDS = 120
 
-/**
- * Loads the current round contribution list from Redis.
- *
- * @param {string} jobId
- * @param {number} roundNum
- * @returns {Promise<Array<Object>>}
- */
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
 async function getRoundContributions(jobId, roundNum) {
   const raw = await redis.get(REDIS_KEYS.jobWeights(jobId, roundNum))
   return raw ? JSON.parse(raw) : []
 }
 
-/**
- * Persists the current round contribution list in Redis.
- *
- * @param {string} jobId
- * @param {number} roundNum
- * @param {Array<Object>} contributions
- * @returns {Promise<void>}
- */
 async function saveRoundContributions(jobId, roundNum, contributions) {
   await redis.setex(
     REDIS_KEYS.jobWeights(jobId, roundNum),
@@ -38,20 +29,19 @@ async function saveRoundContributions(jobId, roundNum, contributions) {
   )
 }
 
-/**
- * Saves the final global weights as a JSON artifact in the uploads directory.
- * v1 deliberately stores flat lists over JSON for transport simplicity; the
- * browser and Python agent can both consume this without tensor-specific code.
- *
- * @param {Object} params
- * @param {string} params.jobId
- * @param {string} params.modelType
- * @param {number[]} params.globalWeights
- * @param {number} params.finalAccuracy
- * @param {number} params.finalLoss
- * @param {number} params.totalRounds
- * @returns {Promise<string>}
- */
+async function getRoundEvalContributions(jobId, roundNum) {
+  const raw = await redis.get(REDIS_KEYS.jobEval(jobId, roundNum))
+  return raw ? JSON.parse(raw) : []
+}
+
+async function saveRoundEvalContributions(jobId, roundNum, contributions) {
+  await redis.setex(
+    REDIS_KEYS.jobEval(jobId, roundNum),
+    ROUND_CACHE_TTL_SECONDS,
+    JSON.stringify(contributions)
+  )
+}
+
 async function saveModelArtifact({ jobId, modelType, globalWeights, finalAccuracy, finalLoss, totalRounds }) {
   const uploadDir = path.resolve(process.cwd(), process.env.UPLOAD_DIR || './uploads')
   await mkdir(uploadDir, { recursive: true })
@@ -71,17 +61,216 @@ async function saveModelArtifact({ jobId, modelType, globalWeights, finalAccurac
 }
 
 /**
- * Prepares the next synchronous round. FedAvg v1 intentionally waits for all
- * devices before dispatching again because the convergence story is simpler for
- * interview review and easier to reason about during live demos.
- *
- * @param {Object} params
- * @param {any} params.io
- * @param {any} params.job
- * @param {number} params.nextRound
- * @param {number[]} params.globalWeights
- * @returns {Promise<void>}
+ * After all assignments for the round are completed, aggregate weights, global eval, persist round, advance job.
  */
+async function finalizeAggregatedRound(io, jobId, roundNum) {
+  const lockKey = REDIS_KEYS.jobRoundAggLock(jobId, roundNum)
+  const locked = await redis.set(lockKey, '1', 'EX', AGG_LOCK_TTL_SECONDS, 'NX')
+  if (!locked) {
+    return
+  }
+
+  const doneKey = REDIS_KEYS.jobRoundFinalized(jobId, roundNum)
+
+  try {
+    if (await redis.get(doneKey)) {
+      return
+    }
+
+    const inProgress = await prisma.taskAssignment.count({
+      where: { jobId, roundNum, status: 'IN_PROGRESS' },
+    })
+    if (inProgress > 0) {
+      return
+    }
+
+    const job = await prisma.trainingJob.findUnique({
+      where: { id: jobId },
+      include: { session: true },
+    })
+
+    if (!job || job.status !== 'RUNNING') {
+      return
+    }
+
+    if (job.currentRound !== roundNum) {
+      return
+    }
+
+    const dedupedStore = await getRoundContributions(jobId, roundNum)
+    const aggregateWeights = dedupedStore.filter(
+      (c) => !c.skipped && Array.isArray(c.weights) && c.weights.length > 0
+    )
+
+    if (aggregateWeights.length === 0) {
+      logger.error(`Round ${roundNum} job ${jobId}: no valid weight contributions to aggregate`)
+      await prisma.trainingJob.update({ where: { id: jobId }, data: { status: 'FAILED' } })
+      io.to(job.sessionId).emit('training:paused', {
+        reason: 'aggregation_failed',
+        message: 'No valid local models were received for this round.',
+      })
+      return
+    }
+
+    const { globalWeights, totalSamples } = fedAvgAggregate(aggregateWeights)
+    const trainingMetrics = computeWeightedRoundMetrics(aggregateWeights)
+
+    await redis.setex(
+      REDIS_KEYS.jobGlobalWeights(jobId),
+      ROUND_CACHE_TTL_SECONDS,
+      JSON.stringify(globalWeights)
+    )
+
+    await redis.del(REDIS_KEYS.jobEval(jobId, roundNum))
+
+    const contributorIds = aggregateWeights.map((e) => e.deviceId)
+    const devices = await prisma.device.findMany({
+      where: { id: { in: contributorIds } },
+    })
+    const deviceById = new Map(devices.map((d) => [d.id, d]))
+
+    const evalPayload = {
+      jobId,
+      roundNum,
+      globalWeights,
+      modelType: job.modelType,
+    }
+
+    for (const deviceId of contributorIds) {
+      const dev = deviceById.get(deviceId)
+      if (dev?.socketId) {
+        io.to(dev.socketId).emit('training:evaluate', evalPayload)
+      }
+    }
+
+    const expectedEval = contributorIds.length
+    const deadline = Date.now() + EVAL_WAIT_MS
+    let evalRows = []
+    while (Date.now() < deadline) {
+      evalRows = await getRoundEvalContributions(jobId, roundNum)
+      if (evalRows.length >= expectedEval) {
+        break
+      }
+      await sleep(EVAL_POLL_MS)
+    }
+
+    let avgLoss
+    let avgAccuracy
+    if (evalRows.length > 0) {
+      const m = computeWeightedRoundMetrics(evalRows)
+      avgLoss = m.avgLoss
+      avgAccuracy = m.avgAccuracy
+    } else {
+      avgLoss = trainingMetrics.avgLoss
+      avgAccuracy = trainingMetrics.avgAccuracy
+      logger.warn(`Round ${roundNum} job ${jobId}: no eval responses — using training-time weighted metrics`)
+    }
+
+    await prisma.trainingRound.create({
+      data: {
+        jobId,
+        roundNum,
+        loss: avgLoss,
+        accuracy: avgAccuracy,
+        duration: 0,
+      },
+    })
+
+    await prisma.trainingJob.update({
+      where: { id: jobId },
+      data: {
+        status: 'AGGREGATING',
+        currentRound: roundNum,
+        totalSamples,
+      },
+    })
+
+    await redis.setex(
+      REDIS_KEYS.jobState(jobId),
+      ROUND_CACHE_TTL_SECONDS,
+      JSON.stringify({
+        id: jobId,
+        status: 'AGGREGATING',
+        currentRound: roundNum,
+        sessionId: job.sessionId,
+        modelType: job.modelType,
+        datasetPath: job.datasetPath,
+      })
+    )
+
+    const roundDevices = await prisma.device.findMany({
+      where: { id: { in: aggregateWeights.map((e) => e.deviceId) } },
+      select: { id: true, deviceName: true, computeType: true, os: true },
+    })
+    const deviceMeta = new Map(roundDevices.map((d) => [d.id, d]))
+
+    io.to(job.sessionId).emit('training:round_complete', {
+      jobId,
+      round: roundNum,
+      totalRounds: job.numRounds,
+      loss: Number(avgLoss.toFixed(4)),
+      accuracy: Number(avgAccuracy.toFixed(4)),
+      deviceContributions: aggregateWeights.map((entry) => {
+        const meta = deviceMeta.get(entry.deviceId)
+        return {
+          deviceId: entry.deviceId,
+          name: meta?.deviceName,
+          computeType: meta?.computeType,
+          os: meta?.os,
+          samples: entry.shardSize,
+          shardSize: entry.shardSize,
+          contribution: totalSamples > 0 ? entry.shardSize / totalSamples : 0,
+        }
+      }),
+    })
+
+    await redis.del(REDIS_KEYS.jobWeights(jobId, roundNum))
+    await redis.setex(doneKey, ROUND_CACHE_TTL_SECONDS, '1')
+
+    if (roundNum < job.numRounds) {
+      await prisma.trainingJob.update({ where: { id: jobId }, data: { status: 'RUNNING' } })
+      await dispatchNextRound({ io, job, nextRound: roundNum + 1, globalWeights })
+      return
+    }
+
+    const modelPath = await saveModelArtifact({
+      jobId,
+      modelType: job.modelType,
+      globalWeights,
+      finalAccuracy: avgAccuracy,
+      finalLoss: avgLoss,
+      totalRounds: job.numRounds,
+    })
+
+    await prisma.trainingJob.update({
+      where: { id: jobId },
+      data: {
+        modelPath,
+        status: 'RUNNING',
+      },
+    })
+
+    const trainingService = getTrainingService()
+    if (!trainingService) {
+      throw new Error('Training service is not initialized')
+    }
+
+    await trainingService.completeJob(jobId, job.sessionId)
+  } finally {
+    await redis.del(lockKey).catch(() => {})
+  }
+}
+
+export async function checkRoundCompletion(io, jobId, roundNum) {
+  const inProgress = await prisma.taskAssignment.count({
+    where: { jobId, roundNum, status: 'IN_PROGRESS' },
+  })
+  if (inProgress > 0) {
+    return
+  }
+  await finalizeAggregatedRound(io, jobId, roundNum)
+}
+
 async function dispatchNextRound({ io, job, nextRound, globalWeights }) {
   const trainingService = getTrainingService()
   if (!trainingService) {
@@ -107,34 +296,168 @@ async function dispatchNextRound({ io, job, nextRound, globalWeights }) {
     return
   }
 
+  io.to(job.sessionId).emit('training:global_model', { jobId: job.id, roundNum: nextRound - 1, globalWeights })
+
   await trainingService.dispatchRound({
     jobId: job.id,
     sessionId: job.sessionId,
     modelType: job.modelType,
     datasetPath: job.datasetPath,
-    datasetContent: job.datasetContent,
+    totalRows: job.totalRows,
     learningRate: job.learningRate,
     batchSize: job.batchSize,
     roundNum: nextRound,
     globalWeights,
     devices: eligibleDevices,
   })
-
-  io.to(job.sessionId).emit('training:global_model', { jobId: job.id, roundNum: nextRound - 1, globalWeights })
 }
 
 /**
- * Registers socket handlers for device weight uploads and checkpoints.
- *
- * @param {import('socket.io').Server} io
- * @param {import('socket.io').Socket} socket
+ * When a device drops mid-round: reassign its IN_PROGRESS task or mark FAILED, then try to complete the round.
  */
+export async function reassignDroppedDeviceTrainingTask(io, droppedDeviceId) {
+  const activeTask = await prisma.taskAssignment.findFirst({
+    where: { deviceId: droppedDeviceId, status: 'IN_PROGRESS' },
+    include: { job: { include: { session: { include: { devices: true } } } } },
+  })
+
+  if (!activeTask || activeTask.job.status !== 'RUNNING') {
+    return
+  }
+
+  const { job, roundNum, sessionId } = {
+    job: activeTask.job,
+    roundNum: activeTask.roundNum,
+    sessionId: activeTask.job.sessionId,
+  }
+
+  if (job.currentRound !== roundNum) {
+    return
+  }
+
+  const remainingDevices = activeTask.job.session.devices.filter(
+    (d) => d.id !== droppedDeviceId && d.status !== 'DROPPED' && d.status !== 'DISCONNECTED'
+  )
+
+  const assignedThisRound = await prisma.taskAssignment.findMany({
+    where: { jobId: activeTask.jobId, roundNum },
+    select: { deviceId: true, status: true },
+  })
+  const busyIds = new Set(
+    assignedThisRound
+      .filter((a) => a.status === 'IN_PROGRESS' || a.status === 'COMPLETED')
+      .map((a) => a.deviceId)
+  )
+
+  const eligible = filterEligibleDevices(remainingDevices).filter((d) => !busyIds.has(d.id))
+
+  await prisma.taskAssignment.update({
+    where: { id: activeTask.id },
+    data: { status: 'REASSIGNED' },
+  })
+
+  if (eligible.length > 0) {
+    const bestDevice = eligible[0]
+
+    const newAssignment = await prisma.taskAssignment.create({
+      data: {
+        jobId: activeTask.jobId,
+        deviceId: bestDevice.id,
+        status: 'IN_PROGRESS',
+        shardStart: activeTask.shardStart,
+        shardEnd: activeTask.shardEnd,
+        shardSize: activeTask.shardSize,
+        roundNum: activeTask.roundNum,
+        checkpointPath: activeTask.checkpointPath,
+      },
+    })
+
+    io.to(sessionId).emit('training:task_reassigned', {
+      fromDeviceId: droppedDeviceId,
+      toDeviceId: bestDevice.id,
+      taskId: activeTask.id,
+      roundNum: activeTask.roundNum,
+      checkpointPath: activeTask.checkpointPath,
+    })
+
+    const redisDevice = await redis.get(REDIS_KEYS.device(bestDevice.id))
+    const cachedDevice = redisDevice ? JSON.parse(redisDevice) : {}
+
+    await prisma.device.update({
+      where: { id: bestDevice.id },
+      data: { status: 'TRAINING', activeTasks: 1 },
+    })
+
+    await redis.setex(
+      REDIS_KEYS.device(bestDevice.id),
+      300,
+      JSON.stringify({
+        ...cachedDevice,
+        id: bestDevice.id,
+        sessionId,
+        socketId: bestDevice.socketId,
+        status: 'TRAINING',
+      })
+    )
+
+    const shard = await getShardPayload({
+      datasetPath: activeTask.job.datasetPath,
+      modelType: activeTask.job.modelType,
+      shardStart: activeTask.shardStart,
+      shardEnd: activeTask.shardEnd,
+      shardSize: activeTask.shardSize,
+    })
+
+    let globalWeights = null
+    const gwRaw = await redis.get(REDIS_KEYS.jobGlobalWeights(activeTask.jobId))
+    if (gwRaw) {
+      try {
+        globalWeights = JSON.parse(gwRaw)
+      } catch {
+        globalWeights = null
+      }
+    }
+
+    if (bestDevice.socketId) {
+      emitTrainingTaskAssigned(io, {
+        device: bestDevice,
+        assignment: newAssignment,
+        shard,
+        jobId: activeTask.jobId,
+        roundNum: activeTask.roundNum,
+        modelType: activeTask.job.modelType,
+        learningRate: activeTask.job.learningRate,
+        batchSize: activeTask.job.batchSize,
+        globalWeights,
+        checkpointPath: activeTask.checkpointPath,
+      })
+    }
+
+    io.to(sessionId).emit('device:status_update', {
+      deviceId: bestDevice.id,
+      status: 'TRAINING',
+    })
+
+    logger.info(`Task ${activeTask.id} reassigned from ${droppedDeviceId} to ${bestDevice.id}`)
+  } else {
+    await prisma.taskAssignment.update({
+      where: { id: activeTask.id },
+      data: { status: 'FAILED' },
+    })
+    logger.warn(`No eligible device to reassign task ${activeTask.id} — marked FAILED`)
+  }
+
+  await checkRoundCompletion(io, activeTask.jobId, activeTask.roundNum)
+}
+
 export function registerTrainingHandlers(io, socket) {
-  socket.on('training:weights_ready', async ({ jobId, roundNum, weights, loss, accuracy }) => {
+  socket.on('training:weights_ready', async (payload) => {
     try {
       if (!socket.deviceId) {
         return
       }
+
+      const { jobId, roundNum, weights, loss, accuracy, skipped } = payload
 
       const job = await prisma.trainingJob.findUnique({
         where: { id: jobId },
@@ -174,13 +497,23 @@ export function registerTrainingHandlers(io, socket) {
 
       const weightStore = await getRoundContributions(jobId, roundNum)
       const dedupedStore = weightStore.filter((entry) => entry.deviceId !== socket.deviceId)
-      dedupedStore.push({
-        deviceId: socket.deviceId,
-        weights,
-        shardSize: assignment.shardSize,
-        loss,
-        accuracy,
-      })
+
+      if (skipped) {
+        dedupedStore.push({
+          deviceId: socket.deviceId,
+          skipped: true,
+          shardSize: assignment.shardSize,
+        })
+      } else {
+        dedupedStore.push({
+          deviceId: socket.deviceId,
+          weights,
+          shardSize: assignment.shardSize,
+          loss,
+          accuracy,
+        })
+      }
+
       await saveRoundContributions(jobId, roundNum, dedupedStore)
 
       await prisma.taskAssignment.update({
@@ -204,119 +537,43 @@ export function registerTrainingHandlers(io, socket) {
 
       io.to(job.sessionId).emit('device:status_update', { deviceId: socket.deviceId, status: 'ACTIVE' })
 
-      const activeAssignments = await prisma.taskAssignment.findMany({
-        where: {
-          jobId,
-          roundNum,
-          status: { in: ['PENDING', 'IN_PROGRESS', 'COMPLETED'] },
-        },
+      const inProgress = await prisma.taskAssignment.count({
+        where: { jobId, roundNum, status: 'IN_PROGRESS' },
       })
 
-      const expectedDeviceIds = new Set(activeAssignments.map((task) => task.deviceId))
-      const receivedDeviceIds = new Set(dedupedStore.map((entry) => entry.deviceId))
-      const allSubmitted = Array.from(expectedDeviceIds).every((deviceId) => receivedDeviceIds.has(deviceId))
+      logger.info(`Round ${roundNum}: pending IN_PROGRESS assignments: ${inProgress}`)
 
-      logger.info(`Round ${roundNum}: ${receivedDeviceIds.size}/${expectedDeviceIds.size} weights received`)
-
-      if (!allSubmitted) {
+      if (inProgress > 0) {
         return
       }
 
-      const { globalWeights, totalSamples } = fedAvgAggregate(dedupedStore)
-      const avgLoss = dedupedStore.reduce((sum, entry) => sum + entry.loss, 0) / dedupedStore.length
-      const avgAccuracy = dedupedStore.reduce((sum, entry) => sum + entry.accuracy, 0) / dedupedStore.length
-
-      await prisma.trainingRound.create({
-        data: {
-          jobId,
-          roundNum,
-          loss: avgLoss,
-          accuracy: avgAccuracy,
-          duration: 0,
-        },
-      })
-
-      await prisma.trainingJob.update({
-        where: { id: jobId },
-        data: {
-          status: 'AGGREGATING',
-          currentRound: roundNum,
-          totalSamples,
-        },
-      })
-
-      await redis.setex(
-        REDIS_KEYS.jobState(jobId),
-        ROUND_CACHE_TTL_SECONDS,
-        JSON.stringify({
-          id: jobId,
-          status: 'AGGREGATING',
-          currentRound: roundNum,
-          sessionId: job.sessionId,
-          modelType: job.modelType,
-          datasetPath: job.datasetPath,
-        })
-      )
-
-      const roundDevices = await prisma.device.findMany({
-        where: { id: { in: dedupedStore.map((e) => e.deviceId) } },
-        select: { id: true, deviceName: true, computeType: true, os: true },
-      })
-      const deviceMeta = new Map(roundDevices.map((d) => [d.id, d]))
-
-      io.to(job.sessionId).emit('training:round_complete', {
-        jobId,
-        round: roundNum,
-        totalRounds: job.numRounds,
-        loss: Number(avgLoss.toFixed(4)),
-        accuracy: Number(avgAccuracy.toFixed(4)),
-        deviceContributions: dedupedStore.map((entry) => {
-          const meta = deviceMeta.get(entry.deviceId)
-          return {
-            deviceId: entry.deviceId,
-            name: meta?.deviceName,
-            computeType: meta?.computeType,
-            os: meta?.os,
-            samples: entry.shardSize,
-            shardSize: entry.shardSize,
-            contribution: totalSamples > 0 ? entry.shardSize / totalSamples : 0,
-          }
-        }),
-      })
-
-      await redis.del(REDIS_KEYS.jobWeights(jobId, roundNum))
-
-      if (roundNum < job.numRounds) {
-        await prisma.trainingJob.update({ where: { id: jobId }, data: { status: 'RUNNING' } })
-        await dispatchNextRound({ io, job, nextRound: roundNum + 1, globalWeights })
-        return
-      }
-
-      const modelPath = await saveModelArtifact({
-        jobId,
-        modelType: job.modelType,
-        globalWeights,
-        finalAccuracy: avgAccuracy,
-        finalLoss: avgLoss,
-        totalRounds: job.numRounds,
-      })
-
-      await prisma.trainingJob.update({
-        where: { id: jobId },
-        data: {
-          modelPath,
-          status: 'RUNNING',
-        },
-      })
-
-      const trainingService = getTrainingService()
-      if (!trainingService) {
-        throw new Error('Training service is not initialized')
-      }
-
-      await trainingService.completeJob(jobId, job.sessionId)
+      await checkRoundCompletion(io, jobId, roundNum)
     } catch (error) {
       logger.error('training:weights_ready error:', error)
+    }
+  })
+
+  socket.on('training:eval_result', async (payload) => {
+    try {
+      if (!socket.deviceId) {
+        return
+      }
+      const { jobId, roundNum, accuracy, loss, shardSize } = payload
+      if (!jobId || roundNum === undefined) {
+        return
+      }
+
+      const store = await getRoundEvalContributions(jobId, roundNum)
+      const deduped = store.filter((e) => e.deviceId !== socket.deviceId)
+      deduped.push({
+        deviceId: socket.deviceId,
+        accuracy: Number(accuracy) || 0,
+        loss: Number(loss) || 0,
+        shardSize: Number(shardSize) || 0,
+      })
+      await saveRoundEvalContributions(jobId, roundNum, deduped)
+    } catch (error) {
+      logger.error('training:eval_result error:', error)
     }
   })
 

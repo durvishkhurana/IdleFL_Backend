@@ -2,19 +2,15 @@
 import { createReadStream } from 'fs'
 import { access } from 'fs/promises'
 import { constants as fsConstants } from 'fs'
+import { createHash } from 'crypto'
 import { asyncHandler } from '../../utils/asyncHandler.js'
+import { extractTabularTrainingMetadata } from '../../utils/dataPartitioner.js'
 
 // TrainingService is instantiated with the io instance in server.js, injected here
 let trainingService
 
 export function initTrainingController(service) {
   trainingService = service
-}
-
-function stripDatasetContent(job) {
-  if (!job) return job
-  const { datasetContent: _omit, ...rest } = job
-  return rest
 }
 
 export const startTraining = asyncHandler(async (req, res) => {
@@ -30,8 +26,11 @@ export const startTraining = asyncHandler(async (req, res) => {
   const file = req.file
   const demoMode = process.env.DEMO_MODE === 'true'
 
-  let datasetContent = null
   let datasetPath = null
+  let totalRows = null
+  let numFeatures = null
+  let columnNames = null
+  let datasetHash = null
 
   if (!demoMode) {
     if (modelType === 'LINEAR_REGRESSION' || modelType === 'LOGISTIC_REGRESSION') {
@@ -42,7 +41,12 @@ export const startTraining = asyncHandler(async (req, res) => {
       if (!ext) {
         return res.status(400).json({ error: 'A .csv file is required for tabular models' })
       }
-      datasetContent = file.buffer.toString('utf8')
+      const csvText = file.buffer.toString('utf8')
+      const meta = extractTabularTrainingMetadata(csvText)
+      totalRows = meta.totalRows
+      numFeatures = meta.numFeatures
+      columnNames = meta.columnNames
+      datasetHash = createHash('sha256').update(file.buffer).digest('hex')
     } else if (modelType === 'CNN') {
       if (!file) {
         return res.status(400).json({ error: 'ZIP dataset file is required for CNN' })
@@ -51,6 +55,7 @@ export const startTraining = asyncHandler(async (req, res) => {
         return res.status(400).json({ error: 'A .zip file is required for CNN' })
       }
       datasetPath = file.originalname
+      datasetHash = createHash('sha256').update(file.buffer).digest('hex')
     }
   }
 
@@ -61,12 +66,15 @@ export const startTraining = asyncHandler(async (req, res) => {
     numRounds,
     batchSize,
     datasetPath,
-    datasetContent,
+    totalRows,
+    numFeatures,
+    columnNames,
+    datasetHash,
     userId: req.user.id,
   })
 
   res.status(201).json({
-    job: stripDatasetContent(result.job),
+    job: result.job,
     eligibleDevices: result.eligibleDevices,
   })
 })
@@ -78,11 +86,11 @@ export const abortTraining = asyncHandler(async (req, res) => {
 
 export const getResults = asyncHandler(async (req, res) => {
   const job = await trainingService.getJobResults(req.params.jobId, req.user.id)
-  res.json({ job: stripDatasetContent(job) })
+  res.json({ job })
 })
 
 export const downloadModel = asyncHandler(async (req, res) => {
-  const job = stripDatasetContent(await trainingService.getJobResults(req.params.jobId, req.user.id))
+  const job = await trainingService.getJobResults(req.params.jobId, req.user.id)
 
   if (job.status !== 'COMPLETED') {
     return res.status(400).json({ error: 'Training job is not completed yet' })

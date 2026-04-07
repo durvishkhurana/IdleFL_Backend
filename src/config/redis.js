@@ -20,6 +20,10 @@ export const REDIS_KEYS = {
   jobState: (jobId) => `job:${jobId}:state`,
   jobRound: (jobId) => `job:${jobId}:round`,
   jobWeights: (jobId, round) => `job:${jobId}:round:${round}:weights`,
+  jobEval: (jobId, round) => `job:${jobId}:round:${round}:eval`,
+  jobGlobalWeights: (jobId) => `job:${jobId}:global_weights`,
+  jobRoundFinalized: (jobId, round) => `job:${jobId}:round:${round}:finalized`,
+  jobRoundAggLock: (jobId, round) => `job:${jobId}:round:${round}:agg_lock`,
   deviceTask: (deviceId) => `device:${deviceId}:task`,
 }
 

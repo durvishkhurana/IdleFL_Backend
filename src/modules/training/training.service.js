@@ -2,11 +2,63 @@ import { prisma } from '../../config/database.js'
 import { redis, REDIS_KEYS } from '../../config/redis.js'
 import { filterEligibleDevices } from '../../utils/deviceScoring.js'
 import { partitionDataset } from '../../utils/dataPartitioner.js'
-import { fedAvgAggregate, generateMockWeights } from './fedavg.js'
+import { computeWeightedRoundMetrics, fedAvgAggregate, generateMockWeights } from './fedavg.js'
 import { logger } from '../../config/logger.js'
-import { config } from '../../config/app.js'
+import { config as appConfig } from '../../config/app.js'
+import { epochsForModelType } from './training.constants.js'
 
 let activeTrainingService = null
+
+/**
+ * @param {import('socket.io').Server} io
+ * @param {Object} opts
+ */
+export function emitTrainingTaskAssigned(io, opts) {
+  const {
+    device,
+    assignment,
+    shard,
+    jobId,
+    roundNum,
+    modelType,
+    learningRate,
+    batchSize,
+    globalWeights,
+    checkpointPath,
+  } = opts
+
+  if (!device?.socketId) {
+    return
+  }
+
+  const epochs = epochsForModelType(modelType)
+  const shardPayload =
+    modelType === 'CNN'
+      ? { datasetName: shard.datasetName, indices: shard.indices, format: 'images' }
+      : { shardStart: shard.shardStart, shardEnd: shard.shardEnd, shardSize: shard.shardSize, format: 'tabular' }
+
+  const cp = checkpointPath ?? assignment?.checkpointPath ?? ''
+
+  io.to(device.socketId).emit('training:task_assigned', {
+    taskId: assignment.id,
+    jobId,
+    roundNum,
+    modelType,
+    config: {
+      learningRate,
+      batchSize,
+      epochs,
+      globalWeights,
+      checkpointInterval: appConfig.checkpointInterval,
+      learning_rate: learningRate,
+      batch_size: batchSize,
+      global_weights: globalWeights,
+      round_num: roundNum,
+      checkpointPath: cp,
+    },
+    shard: shardPayload,
+  })
+}
 
 export class TrainingService {
   constructor(io) {
@@ -14,7 +66,19 @@ export class TrainingService {
     activeTrainingService = this
   }
 
-  async startTraining({ sessionId, modelType, learningRate, numRounds, batchSize, datasetPath, datasetContent, userId }) {
+  async startTraining({
+    sessionId,
+    modelType,
+    learningRate,
+    numRounds,
+    batchSize,
+    datasetPath,
+    totalRows,
+    numFeatures,
+    columnNames,
+    datasetHash,
+    userId,
+  }) {
     const parsedLearningRate = parseFloat(learningRate)
     const parsedNumRounds = parseInt(numRounds, 10)
     const parsedBatchSize = parseInt(batchSize, 10)
@@ -47,7 +111,10 @@ export class TrainingService {
         status: 'RUNNING',
         startedAt: new Date(),
         datasetPath,
-        datasetContent,
+        totalRows,
+        numFeatures,
+        columnNames,
+        datasetHash,
         totalSamples: 1000,
       },
     })
@@ -74,7 +141,7 @@ export class TrainingService {
         sessionId,
         modelType,
         datasetPath: job.datasetPath,
-        datasetContent: job.datasetContent,
+        totalRows: job.totalRows,
         learningRate: parsedLearningRate,
         batchSize: parsedBatchSize,
         roundNum: 1,
@@ -130,8 +197,7 @@ export class TrainingService {
       })
 
       const { globalWeights } = fedAvgAggregate(contributions)
-      const avgLoss = contributions.reduce((s, c) => s + c.loss, 0) / contributions.length
-      const avgAccuracy = contributions.reduce((s, c) => s + c.accuracy, 0) / contributions.length
+      const { avgLoss, avgAccuracy } = computeWeightedRoundMetrics(contributions)
 
       await prisma.trainingRound.create({
         data: { jobId: job.id, roundNum: currentRound, loss: avgLoss, accuracy: avgAccuracy, duration: 2.5 },
@@ -202,25 +268,12 @@ export class TrainingService {
   }
 
   /**
-   * Creates round assignments, caches the active task in Redis, and dispatches
-   * the shard to each device socket. Rounds are synchronous in v1: every device
-   * must finish before the server aggregates with FedAvg.
-   *
    * @param {Object} opts
-   * @param {string} opts.jobId
-   * @param {string} opts.sessionId
-   * @param {string} opts.modelType
-   * @param {string | null} opts.datasetPath
-   * @param {string | null} opts.datasetContent
-   * @param {number} opts.learningRate
-   * @param {number} opts.batchSize
-   * @param {number} opts.roundNum
-   * @param {number[] | null} opts.globalWeights
-   * @param {Array} opts.devices
-   * @returns {Promise<Array<Object>>}
+   * @param {string | null | undefined} opts.datasetPath
+   * @param {number | null | undefined} opts.totalRows
    */
-  async dispatchRound({ jobId, sessionId, modelType, datasetPath, datasetContent, learningRate, batchSize, roundNum, globalWeights, devices }) {
-    const shards = await partitionDataset({ datasetPath, datasetContent, devices, modelType })
+  async dispatchRound({ jobId, sessionId, modelType, datasetPath, totalRows, learningRate, batchSize, roundNum, globalWeights, devices }) {
+    const shards = await partitionDataset({ datasetPath, totalRows, devices, modelType })
     const activeDevices = devices.filter((device) => shards.some((shard) => shard.deviceId === device.id))
 
     await prisma.taskAssignment.deleteMany({
@@ -269,6 +322,8 @@ export class TrainingService {
     )
     await redis.setex(REDIS_KEYS.jobRound(jobId), 3600, String(roundNum))
 
+    const epochs = epochsForModelType(modelType)
+
     for (const device of activeDevices) {
       const shard = shards.find((item) => item.deviceId === device.id)
       const redisDevice = await redis.get(REDIS_KEYS.device(device.id))
@@ -295,27 +350,19 @@ export class TrainingService {
       if (device.socketId) {
         const assignment = assignmentsByDeviceId.get(device.id)
         logger.info(
-          `Round ${roundNum} dispatched — globalWeights length: ${globalWeights ? globalWeights.length : 0}`
+          `Round ${roundNum} dispatched — globalWeights length: ${globalWeights ? globalWeights.length : 0}, epochs: ${epochs}`
         )
-        this.io.to(device.socketId).emit('training:task_assigned', {
-          taskId: assignment.id,
+        emitTrainingTaskAssigned(this.io, {
+          device,
+          assignment,
+          shard,
           jobId,
           roundNum,
           modelType,
-          config: {
-            learningRate,
-            batchSize,
-            epochs: 1,
-            globalWeights,
-            checkpointInterval: config.checkpointInterval,
-            learning_rate: learningRate,
-            batch_size: batchSize,
-            global_weights: globalWeights,
-            round_num: roundNum,
-          },
-          shard: modelType === 'CNN'
-            ? { datasetName: shard.datasetName, indices: shard.indices, format: 'images' }
-            : { X: shard.X, y: shard.y, format: 'tabular' },
+          learningRate,
+          batchSize,
+          globalWeights,
+          checkpointPath: assignment.checkpointPath,
         })
       } else {
         logger.warn(`Skipping round ${roundNum} dispatch for offline device ${device.id}`)
