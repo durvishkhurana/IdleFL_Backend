@@ -6,6 +6,10 @@ import { registerTrainingHandlers } from './handlers/training.handler.js'
 import { registerTerminalHandlers } from './handlers/terminal.handler.js'
 import { logger } from '../config/logger.js'
 
+// CNN sends large weight tensors as JSON; default maxHttpBufferSize (~1MB) drops the socket (transport error).
+const maxHttpBufferMb = parseInt(process.env.SOCKET_IO_MAX_HTTP_BUFFER_MB || '100', 10)
+const maxHttpBufferSize = Math.max(1, maxHttpBufferMb) * 1024 * 1024
+
 export function createSocketServer(httpServer) {
   const io = new Server(httpServer, {
     cors: {
@@ -13,10 +17,16 @@ export function createSocketServer(httpServer) {
       methods: ['GET', 'POST'],
       credentials: true,
     },
-    pingTimeout: 60000,
-    pingInterval: 25000,
+    // Longer pings for slow clients / heavy GPU work between heartbeats (CNN rounds).
+    pingTimeout: parseInt(process.env.SOCKET_IO_PING_TIMEOUT_MS || '120000', 10),
+    pingInterval: parseInt(process.env.SOCKET_IO_PING_INTERVAL_MS || '30000', 10),
+    maxHttpBufferSize,
     transports: ['websocket', 'polling'],
   })
+
+  logger.info(
+    `Socket.IO: maxHttpBufferSize=${maxHttpBufferMb}MB, pingTimeout=${parseInt(process.env.SOCKET_IO_PING_TIMEOUT_MS || '120000', 10)}ms`
+  )
 
   io.use(socketAuthMiddleware)
 
