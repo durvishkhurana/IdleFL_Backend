@@ -469,13 +469,23 @@ def _load_cnn_dependencies():
 
 
 def _train_cnn(data_shard, config, mu):
-    """Trains the small IdleFL CNN on the assigned MNIST or CIFAR-10 subset."""
+    """Trains the small IdleFL CNN on the assigned local image-folder subset."""
     torch, nn, f, torchvision, DataLoader, Subset, transforms = _load_cnn_dependencies()
 
     dataset_name = (data_shard.get("dataset_name") or data_shard.get("datasetName") or "mnist").lower()
     indices = data_shard.get("indices") or []
     if not indices:
         raise ValueError("CNN shard did not include dataset indices")
+
+    # v2: CNN data is loaded locally from DATASET_PATH, not downloaded.
+    # Expected structure:
+    #   DATASET_PATH/
+    #     train/<class_name>/*.png|jpg
+    #     test/<class_name>/*.png|jpg
+    data_root = str(DATASET_PATH or "").strip()
+    if not data_root:
+        raise ValueError("DATASET_PATH not set — required for CNN")
+    train_root = os.path.join(data_root, "train")
 
     class IdleFLCNN(nn.Module):
         """Small CNN used for fast federated demos on consumer hardware."""
@@ -525,12 +535,15 @@ def _train_cnn(data_shard, config, mu):
             else:
                 model.load_state_dict(state_dict)
 
-    data_root = os.path.expanduser("~/.idlefl_data")
-    transform = transforms.ToTensor()
+    # Load local dataset from folders.
+    # For MNIST-like grayscale images, force 1-channel tensors.
     if dataset_name == "cifar10":
-        dataset = torchvision.datasets.CIFAR10(root=data_root, train=True, download=True, transform=transform)
+        transform = transforms.ToTensor()
     else:
-        dataset = torchvision.datasets.MNIST(root=data_root, train=True, download=True, transform=transform)
+        transform = transforms.Compose([transforms.Grayscale(num_output_channels=1), transforms.ToTensor()])
+
+    ImageFolder = torchvision.datasets.ImageFolder
+    dataset = ImageFolder(root=train_root, transform=transform)
 
     subset = Subset(dataset, indices)
     batch_size = int(_config_value(config, "batch_size", "batchSize", DEFAULT_BATCH_SIZE))
@@ -959,6 +972,21 @@ async def run_agent():
                 ys = shard.get("y") or []
                 _LAST_SHARD_SIZE[job_id] = len(ys) if ys is not None else 0
         elif model_type == "CNN":
+            if not str(DATASET_PATH).strip():
+                print("[✗] DATASET_PATH not set — required for CNN")
+                await sio.emit(
+                    "training:weights_ready",
+                    {
+                        "jobId": job_id,
+                        "roundNum": round_num,
+                        "weights": [],
+                        "loss": 0,
+                        "accuracy": 0,
+                        "skipped": True,
+                    },
+                )
+                print("[✓] Skipped task (no local image folder)")
+                return
             _LAST_SHARD_SIZE[job_id] = len(shard.get("indices") or [])
         else:
             _LAST_SHARD_SIZE[job_id] = 0
