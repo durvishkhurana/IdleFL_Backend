@@ -995,16 +995,40 @@ async def run_agent():
 
         print(f"\n[●] Round {round_num} - training {model_type}...")
         result = await asyncio.to_thread(train_locally, model_type, shard, config, mu)
-        print(f"[●] Sending weights ({len(result['weights'])} floats)...")
+        weights_out = result.get("weights") or []
+        print(f"[●] Sending weights ({len(weights_out)} floats)...")
 
-        await sio.emit("training:weights_ready", {
-            "jobId": job_id,
-            "roundNum": round_num,
-            "weights": result["weights"],
-            "loss": result["loss"],
-            "accuracy": result["accuracy"],
-        })
-        print("[✓] Weights sent")
+        if model_type == "CNN" and len(weights_out) > 0:
+            chunk_size = 10_000
+            total_chunks = (len(weights_out) + chunk_size - 1) // chunk_size
+            for idx in range(total_chunks):
+                start = idx * chunk_size
+                end = min(len(weights_out), start + chunk_size)
+                await sio.emit(
+                    "training:weights_ready",
+                    {
+                        "jobId": job_id,
+                        "roundNum": round_num,
+                        "chunkIndex": idx,
+                        "chunkTotal": total_chunks,
+                        "weightsChunk": weights_out[start:end],
+                        "loss": result.get("loss"),
+                        "accuracy": result.get("accuracy"),
+                    },
+                )
+            print(f"[✓] Weights sent (chunked: {total_chunks} chunks)")
+        else:
+            await sio.emit(
+                "training:weights_ready",
+                {
+                    "jobId": job_id,
+                    "roundNum": round_num,
+                    "weights": weights_out,
+                    "loss": result.get("loss"),
+                    "accuracy": result.get("accuracy"),
+                },
+            )
+            print("[✓] Weights sent")
 
     @sio.on("training:complete")
     async def on_training_complete(data):

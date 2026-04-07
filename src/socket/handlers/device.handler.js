@@ -19,19 +19,31 @@ export function registerDeviceHandlers(io, socket) {
       // Pass through agent value unchanged (expected: CUDA | MPS | CPU). Default only when absent.
       const resolvedComputeType = computeType ?? 'CPU'
 
-      const device = await prisma.device.upsert({
-        where: { id: socket.handshake.auth.deviceId || 'new' },
-        update: { socketId: socket.id, status: 'ACTIVE', os, computeType: resolvedComputeType, lastHeartbeat: new Date() },
-        create: {
-          sessionId: session.id,
-          userId: user.id,
-          deviceName: user.userId,
-          os,
-          computeType: resolvedComputeType,
-          socketId: socket.id,
-          status: 'ACTIVE',
-        },
+      // Reconnect stability: reuse the existing Device row for this user+session.
+      // This avoids duplicate "live devices" entries when the socket reconnects.
+      const existing = await prisma.device.findFirst({
+        where: { sessionId: session.id, userId: user.id },
+        select: { id: true },
       })
+
+      const now = new Date()
+      const device = existing
+        ? await prisma.device.update({
+            where: { id: existing.id },
+            data: { socketId: socket.id, status: 'ACTIVE', os, computeType: resolvedComputeType, lastHeartbeat: now },
+          })
+        : await prisma.device.create({
+            data: {
+              sessionId: session.id,
+              userId: user.id,
+              deviceName: user.userId,
+              os,
+              computeType: resolvedComputeType,
+              socketId: socket.id,
+              status: 'ACTIVE',
+              lastHeartbeat: now,
+            },
+          })
 
       socket.join(session.id)
       socket.deviceId = device.id
@@ -47,17 +59,26 @@ export function registerDeviceHandlers(io, socket) {
 
       socket.emit('device:registered', { deviceId: device.id, sessionId: session.id })
 
-      io.to(session.id).emit('device:joined', {
-        device: {
-          id: device.id,
+      if (!existing) {
+        io.to(session.id).emit('device:joined', {
+          device: {
+            id: device.id,
+            deviceId: device.id,
+            deviceName: device.deviceName,
+            os: device.os,
+            computeType: resolvedComputeType,
+            status: 'ACTIVE',
+            computeScore: 0.5,
+          },
+        })
+      } else {
+        io.to(session.id).emit('device:status_update', {
           deviceId: device.id,
-          deviceName: device.deviceName,
+          status: 'ACTIVE',
           os: device.os,
           computeType: resolvedComputeType,
-          status: 'ACTIVE',
-          computeScore: 0.5,
-        },
-      })
+        })
+      }
     } catch (error) {
       logger.error('device:register error:', error)
       socket.emit('error', { message: 'Registration failed' })

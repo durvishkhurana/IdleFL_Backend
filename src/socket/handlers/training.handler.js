@@ -18,6 +18,23 @@ const AGG_LOCK_TTL_SECONDS = 120
 const roundState = new Map()
 // Key: jobId, Value: { roundNum: number, submitted: string[], totalAssigned: number, timer: any }
 
+async function getWeightsChunkState(jobId, roundNum, deviceId) {
+  const raw = await redis.get(REDIS_KEYS.jobWeightsChunk(jobId, roundNum, deviceId))
+  return raw ? JSON.parse(raw) : null
+}
+
+async function saveWeightsChunkState(jobId, roundNum, deviceId, state) {
+  await redis.setex(
+    REDIS_KEYS.jobWeightsChunk(jobId, roundNum, deviceId),
+    ROUND_CACHE_TTL_SECONDS,
+    JSON.stringify(state)
+  )
+}
+
+async function clearWeightsChunkState(jobId, roundNum, deviceId) {
+  await redis.del(REDIS_KEYS.jobWeightsChunk(jobId, roundNum, deviceId))
+}
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 async function getRoundContributions(jobId, roundNum) {
@@ -544,7 +561,24 @@ export function registerTrainingHandlers(io, socket) {
         return
       }
 
-      const { jobId, roundNum, weights, loss, accuracy, skipped } = payload
+      const {
+        jobId,
+        roundNum,
+        weights,
+        loss,
+        accuracy,
+        skipped,
+        // Chunked CNN uploads (same event name, multiple emits)
+        chunkIndex,
+        chunkTotal,
+        weightsChunk,
+      } = payload
+
+      const isChunked =
+        Number.isInteger(chunkIndex) &&
+        Number.isInteger(chunkTotal) &&
+        chunkTotal > 0 &&
+        Array.isArray(weightsChunk)
 
       const job = await prisma.trainingJob.findUnique({
         where: { id: jobId },
@@ -578,6 +612,65 @@ export function registerTrainingHandlers(io, socket) {
       if (!assignment) {
         logger.warn(`Ignoring weights from device ${socket.deviceId}: no active assignment for round ${roundNum}`)
         return
+      }
+
+      if (isChunked) {
+        const idx = Number(chunkIndex)
+        const total = Number(chunkTotal)
+        if (idx < 0 || idx >= total) {
+          logger.warn(`Ignoring invalid weights chunk idx=${idx}/${total} from device ${socket.deviceId}`)
+          return
+        }
+
+        const existing = (await getWeightsChunkState(jobId, roundNum, socket.deviceId)) || {
+          total,
+          received: {},
+          loss: null,
+          accuracy: null,
+          updatedAt: Date.now(),
+        }
+
+        if (existing.total !== total) {
+          logger.warn(
+            `Chunk total mismatch for job ${jobId} round ${roundNum} device ${socket.deviceId}: ` +
+              `existing=${existing.total} incoming=${total} — resetting chunks`
+          )
+          existing.total = total
+          existing.received = {}
+        }
+
+        existing.received[String(idx)] = weightsChunk
+        if (loss != null) existing.loss = loss
+        if (accuracy != null) existing.accuracy = accuracy
+        existing.updatedAt = Date.now()
+
+        await saveWeightsChunkState(jobId, roundNum, socket.deviceId, existing)
+
+        const receivedCount = Object.keys(existing.received || {}).length
+        logger.info(
+          `Weights chunk received from device ${socket.deviceId}, job ${jobId}, round ${roundNum}: ${receivedCount}/${total}`
+        )
+
+        if (receivedCount < total) {
+          return
+        }
+
+        const assembled = []
+        for (let i = 0; i < total; i += 1) {
+          const part = existing.received[String(i)]
+          if (!Array.isArray(part)) {
+            logger.warn(`Missing chunk ${i}/${total} for job ${jobId} round ${roundNum} device ${socket.deviceId}`)
+            return
+          }
+          assembled.push(...part)
+        }
+
+        await clearWeightsChunkState(jobId, roundNum, socket.deviceId)
+
+        // Continue through the normal single-payload flow with assembled weights.
+        payload.weights = assembled
+        payload.loss = existing.loss ?? loss
+        payload.accuracy = existing.accuracy ?? accuracy
       }
 
       logger.info(`Weights received from device ${socket.deviceId}, job ${jobId}, round ${roundNum}`)
