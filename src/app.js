@@ -21,6 +21,15 @@ export function createApp() {
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   }))
 
+  // Large CNN weight vectors: raw Float32 body (avoid JSON parser consuming the stream)
+  app.use((req, res, next) => {
+    const url = req.originalUrl || req.url || ''
+    if (req.method === 'POST' && /^\/api\/training\/[^/]+\/round\/[^/]+\/weights(?:\?|$)/.test(url)) {
+      return express.raw({ limit: '20mb', type: () => true })(req, res, next)
+    }
+    next()
+  })
+
   app.use(express.json({ limit: '10mb' }))
   app.use(express.urlencoded({ extended: true }))
 

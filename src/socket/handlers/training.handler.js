@@ -166,7 +166,10 @@ async function finalizeAggregatedRound(io, jobId, roundNum, opts = {}) {
 
     const dedupedStore = await getRoundContributions(jobId, roundNum)
     const aggregateWeights = dedupedStore.filter(
-      (c) => !c.skipped && Array.isArray(c.weights) && c.weights.length > 0
+      (c) =>
+        !c.skipped &&
+        ((Array.isArray(c.weights) && c.weights.length > 0) ||
+          (typeof c.weightsBlobKey === 'string' && c.weightsBlobKey.length > 0))
     )
 
     if (aggregateWeights.length === 0) {
@@ -179,8 +182,14 @@ async function finalizeAggregatedRound(io, jobId, roundNum, opts = {}) {
       return
     }
 
-    const { globalWeights, totalSamples } = fedAvgAggregate(aggregateWeights)
+    const { globalWeights, totalSamples } = await fedAvgAggregate(aggregateWeights)
     const trainingMetrics = computeWeightedRoundMetrics(aggregateWeights)
+
+    for (const c of aggregateWeights) {
+      if (typeof c.weightsBlobKey === 'string' && c.weightsBlobKey.length > 0) {
+        await redis.del(c.weightsBlobKey).catch(() => {})
+      }
+    }
 
     await redis.setex(
       REDIS_KEYS.jobGlobalWeights(jobId),
@@ -403,8 +412,182 @@ async function dispatchNextRound({ io, job, nextRound, globalWeights }) {
 }
 
 /**
- * When a device drops mid-round: reassign its IN_PROGRESS task or mark FAILED, then try to complete the round.
+ * Shared round progression (timeout timer, threshold aggregation, completion check).
+ * @param {import('socket.io').Server} io
  */
+async function driveRoundProgressAfterContribution(io, { jobId, roundNum, job, deviceId }) {
+  const totalAssigned = job.taskAssignments.length
+  const existing = roundState.get(jobId)
+  const isSameRound = existing && existing.roundNum === roundNum
+  const state =
+    isSameRound && existing
+      ? existing
+      : { roundNum, submitted: [], totalAssigned, timer: null }
+
+  if (!isSameRound) {
+    if (existing?.timer) {
+      clearTimeout(existing.timer)
+    }
+    roundState.set(jobId, state)
+  }
+
+  if (!state.submitted.includes(deviceId)) {
+    state.submitted.push(deviceId)
+  }
+
+  if (!state.timer) {
+    state.timer = setTimeout(async () => {
+      try {
+        const st = roundState.get(jobId)
+        if (st && st.roundNum === roundNum && st.submitted.length > 0) {
+          logger.info(
+            `Round ${roundNum} job ${jobId}: ROUND_TIMEOUT_SECONDS fired (${ROUND_TIMEOUT_SECONDS}s) — aggregating with ${st.submitted.length}/${st.totalAssigned}`
+          )
+          await finalizeAggregatedRound(io, jobId, roundNum, {
+            allowEarly: true,
+            participatingDevices: st.submitted.length,
+            assignedDevices: st.totalAssigned,
+          })
+          roundState.delete(jobId)
+        }
+      } catch (e) {
+        logger.error(`Round ${roundNum} job ${jobId}: timeout aggregation error:`, e)
+      }
+    }, ROUND_TIMEOUT_SECONDS * 1000)
+
+    logger.info(
+      `Round ${roundNum} job ${jobId}: started aggregation timeout timer (${ROUND_TIMEOUT_SECONDS}s); threshold=${PARTICIPATION_THRESHOLD}`
+    )
+  }
+
+  const needed = Math.ceil(state.totalAssigned * PARTICIPATION_THRESHOLD)
+  if (state.submitted.length >= needed) {
+    logger.info(
+      `Round ${roundNum} job ${jobId}: participation threshold reached (${state.submitted.length}/${state.totalAssigned} >= ${needed}) — aggregating`
+    )
+    if (state.timer) {
+      clearTimeout(state.timer)
+    }
+    await finalizeAggregatedRound(io, jobId, roundNum, {
+      allowEarly: true,
+      participatingDevices: state.submitted.length,
+      assignedDevices: state.totalAssigned,
+    })
+    roundState.delete(jobId)
+    return
+  }
+
+  const inProgress = await prisma.taskAssignment.count({
+    where: { jobId, roundNum, status: 'IN_PROGRESS' },
+  })
+
+  logger.info(`Round ${roundNum}: pending IN_PROGRESS assignments: ${inProgress}`)
+
+  if (inProgress > 0) {
+    return
+  }
+
+  await checkRoundCompletion(io, jobId, roundNum)
+}
+
+/**
+ * HTTP upload for CNN weights (avoids large binary on Socket.IO). Agent JWT required.
+ */
+export async function ingestRoundWeightsHttp(io, { userId, jobId, roundNum, bodyBuffer, loss, accuracy }) {
+  if (!Buffer.isBuffer(bodyBuffer) || bodyBuffer.byteLength === 0) {
+    return { ok: false, status: 400, error: 'empty_body' }
+  }
+  if (bodyBuffer.byteLength % 4 !== 0) {
+    return { ok: false, status: 400, error: 'invalid_binary_length' }
+  }
+
+  const job = await prisma.trainingJob.findUnique({
+    where: { id: jobId },
+    include: {
+      session: true,
+      taskAssignments: {
+        where: {
+          roundNum,
+          status: { in: ['PENDING', 'IN_PROGRESS', 'COMPLETED'] },
+        },
+      },
+    },
+  })
+
+  if (!job) {
+    return { ok: false, status: 404, error: 'job_not_found' }
+  }
+  if (job.status !== 'RUNNING') {
+    return { ok: false, status: 409, error: 'job_not_running' }
+  }
+  if (job.currentRound !== roundNum) {
+    return { ok: false, status: 409, error: 'stale_round' }
+  }
+
+  const device = await prisma.device.findFirst({
+    where: { userId, sessionId: job.sessionId },
+    select: { id: true, socketId: true },
+  })
+  if (!device) {
+    return { ok: false, status: 403, error: 'no_device' }
+  }
+
+  const assignment = job.taskAssignments.find((task) => task.deviceId === device.id)
+  if (!assignment) {
+    return { ok: false, status: 403, error: 'no_assignment' }
+  }
+
+  const floatCount = bodyBuffer.byteLength / 4
+  const vecKey = REDIS_KEYS.jobWeightsVector(jobId, roundNum, device.id)
+  await redis.setex(vecKey, ROUND_CACHE_TTL_SECONDS, bodyBuffer)
+
+  logger.info(`Weights received (HTTP) from device ${device.id}, job ${jobId}, round ${roundNum}`)
+
+  const weightStore = await getRoundContributions(jobId, roundNum)
+  const dedupedStore = weightStore.filter((entry) => entry.deviceId !== device.id)
+  dedupedStore.push({
+    deviceId: device.id,
+    weightsBlobKey: vecKey,
+    weightsLen: floatCount,
+    shardSize: assignment.shardSize,
+    loss: loss != null ? Number(loss) : undefined,
+    accuracy: accuracy != null ? Number(accuracy) : undefined,
+  })
+
+  await saveRoundContributions(jobId, roundNum, dedupedStore)
+
+  await prisma.taskAssignment.update({
+    where: { id: assignment.id },
+    data: { status: 'COMPLETED', completedAt: new Date() },
+  })
+
+  await prisma.device.update({
+    where: { id: device.id },
+    data: { status: 'ACTIVE', activeTasks: 0 },
+  })
+
+  const redisDevice = await redis.get(REDIS_KEYS.device(device.id))
+  const cachedDevice = redisDevice ? JSON.parse(redisDevice) : {}
+  await redis.setex(
+    REDIS_KEYS.device(device.id),
+    300,
+    JSON.stringify({
+      ...cachedDevice,
+      id: device.id,
+      sessionId: job.sessionId,
+      socketId: device.socketId,
+      status: 'ACTIVE',
+    })
+  )
+  await redis.del(REDIS_KEYS.deviceTask(device.id))
+
+  io.to(job.sessionId).emit('device:status_update', { deviceId: device.id, status: 'ACTIVE' })
+
+  await driveRoundProgressAfterContribution(io, { jobId, roundNum, job, deviceId: device.id })
+
+  return { ok: true, status: 200, weightsLen: floatCount }
+}
+
 export async function reassignDroppedDeviceTrainingTask(io, droppedDeviceId) {
   const activeTask = await prisma.taskAssignment.findFirst({
     where: { deviceId: droppedDeviceId, status: 'IN_PROGRESS' },
@@ -654,6 +837,7 @@ export function registerTrainingHandlers(io, socket) {
         const total = Number(chunkTotal)
         if (idx < 0 || idx >= total) {
           logger.warn(`Ignoring invalid weights chunk idx=${idx}/${total} from device ${socket.deviceId}`)
+          ackErr('invalid_chunk')
           return
         }
 
@@ -696,6 +880,7 @@ export function registerTrainingHandlers(io, socket) {
           const part = existing.received[String(i)]
           if (!Array.isArray(part)) {
             logger.warn(`Missing chunk ${i}/${total} for job ${jobId} round ${roundNum} device ${socket.deviceId}`)
+            ackErr('missing_chunk')
             return
           }
           assembled.push(...part)
@@ -738,11 +923,10 @@ export function registerTrainingHandlers(io, socket) {
           return
         }
 
-        // Avoid massive Array.from() that can block the event loop.
-        // Store as base64 and decode later during aggregation.
+        // Store raw Float32 bytes in Redis; metadata JSON stays small (fast ack, no base64 blow-up).
         weights = null
-        payload._weightsBinB64 = buf.toString('base64')
         payload._weightsLen = floatCount
+        payload._weightsBuf = buf
       }
 
       logger.info(`Weights received from device ${socket.deviceId}, job ${jobId}, round ${roundNum}`)
@@ -757,9 +941,10 @@ export function registerTrainingHandlers(io, socket) {
           shardSize: assignment.shardSize,
         })
       } else {
-        const binB64 = payload._weightsBinB64
+        const binBuf = payload._weightsBuf
         const binLen = payload._weightsLen
-        const isBinaryStored = typeof binB64 === 'string' && binB64.length > 0 && Number.isInteger(binLen) && binLen > 0
+        const isBinaryStored =
+          Buffer.isBuffer(binBuf) && binBuf.byteLength > 0 && Number.isInteger(binLen) && binLen > 0
 
         if (!isBinaryStored && (!Array.isArray(weights) || weights.length === 0)) {
           logger.warn(`Ignoring empty weights from device ${socket.deviceId} for job ${jobId} round ${roundNum}`)
@@ -767,12 +952,14 @@ export function registerTrainingHandlers(io, socket) {
           return
         }
 
-        // Ack early so agents don't time out while we write DB/Redis.
-        ackOk({ received: true })
+        const vecKey = isBinaryStored ? REDIS_KEYS.jobWeightsVector(jobId, roundNum, socket.deviceId) : null
+        if (isBinaryStored) {
+          await redis.setex(vecKey, ROUND_CACHE_TTL_SECONDS, binBuf)
+        }
 
         dedupedStore.push({
           deviceId: socket.deviceId,
-          ...(isBinaryStored ? { weightsBinB64: binB64, weightsLen: binLen } : { weights }),
+          ...(isBinaryStored ? { weightsBlobKey: vecKey, weightsLen: binLen } : { weights }),
           shardSize: assignment.shardSize,
           loss,
           accuracy,
@@ -801,85 +988,14 @@ export function registerTrainingHandlers(io, socket) {
       await redis.del(REDIS_KEYS.deviceTask(socket.deviceId))
 
       io.to(job.sessionId).emit('device:status_update', { deviceId: socket.deviceId, status: 'ACTIVE' })
+      // Single Socket.IO ack only (duplicate ack breaks python-socketio call()).
       ackOk({
         stored: true,
         weightsLen: Array.isArray(weights) ? weights.length : payload._weightsLen || 0,
-        binary: typeof payload._weightsBinB64 === 'string',
+        binary: Buffer.isBuffer(payload._weightsBuf),
       })
 
-      const totalAssigned = job.taskAssignments.length
-      const existing = roundState.get(jobId)
-      const isSameRound = existing && existing.roundNum === roundNum
-      const state =
-        isSameRound && existing
-          ? existing
-          : { roundNum, submitted: [], totalAssigned, timer: null }
-
-      if (!isSameRound) {
-        if (existing?.timer) {
-          clearTimeout(existing.timer)
-        }
-        roundState.set(jobId, state)
-      }
-
-      if (!state.submitted.includes(socket.deviceId)) {
-        state.submitted.push(socket.deviceId)
-      }
-
-      // Start timeout when first contribution arrives for the round.
-      if (!state.timer) {
-        state.timer = setTimeout(async () => {
-          try {
-            const st = roundState.get(jobId)
-            if (st && st.roundNum === roundNum && st.submitted.length > 0) {
-              logger.info(
-                `Round ${roundNum} job ${jobId}: ROUND_TIMEOUT_SECONDS fired (${ROUND_TIMEOUT_SECONDS}s) — aggregating with ${st.submitted.length}/${st.totalAssigned}`
-              )
-              await finalizeAggregatedRound(io, jobId, roundNum, {
-                allowEarly: true,
-                participatingDevices: st.submitted.length,
-                assignedDevices: st.totalAssigned,
-              })
-              roundState.delete(jobId)
-            }
-          } catch (e) {
-            logger.error(`Round ${roundNum} job ${jobId}: timeout aggregation error:`, e)
-          }
-        }, ROUND_TIMEOUT_SECONDS * 1000)
-
-        logger.info(
-          `Round ${roundNum} job ${jobId}: started aggregation timeout timer (${ROUND_TIMEOUT_SECONDS}s); threshold=${PARTICIPATION_THRESHOLD}`
-        )
-      }
-
-      const needed = Math.ceil(state.totalAssigned * PARTICIPATION_THRESHOLD)
-      if (state.submitted.length >= needed) {
-        logger.info(
-          `Round ${roundNum} job ${jobId}: participation threshold reached (${state.submitted.length}/${state.totalAssigned} >= ${needed}) — aggregating`
-        )
-        if (state.timer) {
-          clearTimeout(state.timer)
-        }
-        await finalizeAggregatedRound(io, jobId, roundNum, {
-          allowEarly: true,
-          participatingDevices: state.submitted.length,
-          assignedDevices: state.totalAssigned,
-        })
-        roundState.delete(jobId)
-        return
-      }
-
-      const inProgress = await prisma.taskAssignment.count({
-        where: { jobId, roundNum, status: 'IN_PROGRESS' },
-      })
-
-      logger.info(`Round ${roundNum}: pending IN_PROGRESS assignments: ${inProgress}`)
-
-      if (inProgress > 0) {
-        return
-      }
-
-      await checkRoundCompletion(io, jobId, roundNum)
+      await driveRoundProgressAfterContribution(io, { jobId, roundNum, job, deviceId: socket.deviceId })
     } catch (error) {
       logger.error('training:weights_ready error:', error)
       if (typeof ack === 'function') {

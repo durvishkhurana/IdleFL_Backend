@@ -2,6 +2,7 @@ import { createReadStream } from 'fs'
 import { access } from 'fs/promises'
 import { constants as fsConstants } from 'fs'
 import { asyncHandler } from '../../utils/asyncHandler.js'
+import { ingestRoundWeightsHttp } from '../../socket/handlers/training.handler.js'
 
 // TrainingService is instantiated with the io instance in server.js, injected here
 let trainingService
@@ -9,6 +10,34 @@ let trainingService
 export function initTrainingController(service) {
   trainingService = service
 }
+
+export const submitAgentWeights = asyncHandler(async (req, res) => {
+  const { jobId, roundNum } = req.params
+  const round = parseInt(roundNum, 10)
+  if (Number.isNaN(round)) {
+    return res.status(400).json({ error: 'invalid_round' })
+  }
+
+  const loss = req.query.loss !== undefined ? parseFloat(String(req.query.loss)) : undefined
+  const accuracy = req.query.accuracy !== undefined ? parseFloat(String(req.query.accuracy)) : undefined
+
+  const bodyBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0)
+
+  const result = await ingestRoundWeightsHttp(trainingService.io, {
+    userId: req.user.id,
+    jobId,
+    roundNum: round,
+    bodyBuffer,
+    loss: Number.isFinite(loss) ? loss : undefined,
+    accuracy: Number.isFinite(accuracy) ? accuracy : undefined,
+  })
+
+  if (!result.ok) {
+    return res.status(result.status).json({ error: result.error })
+  }
+
+  return res.status(200).json({ ok: true, weightsLen: result.weightsLen })
+})
 
 export const startTraining = asyncHandler(async (req, res) => {
   const { sessionId, modelType } = req.body

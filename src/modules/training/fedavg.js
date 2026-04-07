@@ -1,3 +1,5 @@
+import { redis } from '../../config/redis.js'
+
 /**
  * FedAvg Aggregation — McMahan et al. 2017
  *
@@ -29,17 +31,36 @@ export function computeWeightedRoundMetrics(contributions) {
   return { avgLoss, avgAccuracy }
 }
 
-export function fedAvgAggregate(weightContributions) {
-  // weightContributions: Array of { weights?: number[], weightsBinB64?: string, weightsLen?: number, shardSize: number, deviceId: string }
+export async function fedAvgAggregate(weightContributions) {
+  // weightContributions: Array of { weights?: number[], weightsBinB64?: string, weightsBlobKey?: string, weightsLen?: number, shardSize: number, deviceId: string }
   if (!weightContributions || weightContributions.length === 0) {
     throw new Error('No weight contributions to aggregate')
   }
 
   const totalSamples = weightContributions.reduce((sum, c) => sum + c.shardSize, 0)
 
-  const decodeWeights = (contrib) => {
+  const decodeWeights = async (contrib) => {
     if (Array.isArray(contrib.weights)) {
       return contrib.weights
+    }
+    if (typeof contrib.weightsBlobKey === 'string' && contrib.weightsBlobKey.length > 0) {
+      let buf =
+        typeof redis.getBuffer === 'function'
+          ? await redis.getBuffer(contrib.weightsBlobKey)
+          : await redis.get(contrib.weightsBlobKey)
+      if (buf && !Buffer.isBuffer(buf)) {
+        buf = Buffer.from(buf)
+      }
+      if (!buf || buf.byteLength % 4 !== 0) {
+        throw new Error(`Invalid Redis vector for device ${contrib.deviceId}`)
+      }
+      const view = new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4)
+      if (Number.isInteger(contrib.weightsLen) && contrib.weightsLen > 0 && contrib.weightsLen !== view.length) {
+        throw new Error(
+          `Weight length mismatch: expected ${contrib.weightsLen}, got ${view.length} from device ${contrib.deviceId}`
+        )
+      }
+      return view
     }
     if (typeof contrib.weightsBinB64 === 'string' && contrib.weightsBinB64.length > 0) {
       const buf = Buffer.from(contrib.weightsBinB64, 'base64')
@@ -57,12 +78,12 @@ export function fedAvgAggregate(weightContributions) {
     throw new Error(`Missing weights for device ${contrib.deviceId}`)
   }
 
-  const first = decodeWeights(weightContributions[0])
+  const first = await decodeWeights(weightContributions[0])
   const weightLength = first.length
 
   // Validate all weight vectors are the same length
   for (const contrib of weightContributions) {
-    const w = decodeWeights(contrib)
+    const w = await decodeWeights(contrib)
     if (w.length !== weightLength) {
       throw new Error(
         `Weight length mismatch: expected ${weightLength}, got ${w.length} from device ${contrib.deviceId}`
@@ -76,7 +97,7 @@ export function fedAvgAggregate(weightContributions) {
 
   for (const contrib of weightContributions) {
     const proportion = contrib.shardSize / totalSamples
-    const w = decodeWeights(contrib)
+    const w = await decodeWeights(contrib)
     for (let i = 0; i < weightLength; i++) {
       acc[i] += proportion * w[i]
     }

@@ -2,9 +2,12 @@ import { Router } from 'express'
 import { authenticate } from '../../middleware/auth.middleware.js'
 import { validate } from '../../middleware/validate.middleware.js'
 import { createJobSchema } from './training.schema.js'
-import { startTraining, abortTraining, getResults, downloadModel } from './training.controller.js'
+import { startTraining, abortTraining, getResults, downloadModel, submitAgentWeights } from './training.controller.js'
 
 const router = Router()
+
+/** Agent CNN weights — raw binary POST (see app.js raw parser). JWT = agent token. */
+router.post('/:jobId/round/:roundNum/weights', authenticate, submitAgentWeights)
 
 router.use(authenticate)
 

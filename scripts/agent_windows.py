@@ -52,9 +52,10 @@ DEFAULT_EPOCHS = 1
 MOCK_WEIGHT_SIZE = 16
 
 # CNN weights upload mode:
-# - "bin" (default): send Float32 bytes in one emit (fastest)
-# - "chunk": send JSON chunks (fallback)
-CNN_UPLOAD_MODE = os.environ.get("IDLEFL_CNN_UPLOAD_MODE", "bin").strip().lower()
+# - "http" (default): POST raw Float32 to /api/training/:jobId/round/:n/weights (most reliable on Render)
+# - "bin": Socket.IO binary + ack
+# - "chunk": JSON chunks (fallback)
+CNN_UPLOAD_MODE = os.environ.get("IDLEFL_CNN_UPLOAD_MODE", "http").strip().lower()
 
 
 def detect_hardware():
@@ -825,6 +826,8 @@ async def run_agent():
             print(f"    Server response: {body.get('error', 'unknown error')}")
             return
 
+    http_auth_token = token
+
     print(f"  Connecting to {SERVER_URL}...\n")
 
     sio = socketio.AsyncClient(reconnection=True, reconnection_attempts=10, reconnection_delay=2)
@@ -1040,7 +1043,38 @@ async def run_agent():
         weights_out = result.get("weights") or []
         print(f"[●] Sending weights ({len(weights_out)} floats)...")
 
-        if model_type == "CNN" and len(weights_out) > 0 and CNN_UPLOAD_MODE == "bin":
+        if model_type == "CNN" and len(weights_out) > 0 and CNN_UPLOAD_MODE == "http":
+            arr = np.asarray(weights_out, dtype=np.float32)
+            body = arr.tobytes(order="C")
+            params = {}
+            if result.get("loss") is not None:
+                params["loss"] = str(result["loss"])
+            if result.get("accuracy") is not None:
+                params["accuracy"] = str(result["accuracy"])
+            url = f"{SERVER_URL.rstrip('/')}/api/training/{job_id}/round/{int(round_num)}/weights"
+            timeout = aiohttp.ClientTimeout(total=120)
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as http_sess:
+                    async with http_sess.post(
+                        url,
+                        params=params or None,
+                        data=body,
+                        headers={
+                            "Authorization": f"Bearer {http_auth_token}",
+                            "Content-Type": "application/octet-stream",
+                        },
+                    ) as resp:
+                        try:
+                            j = await resp.json(content_type=None)
+                        except Exception:
+                            j = {"raw": (await resp.text())[:200]}
+                        if resp.status != 200 or not j.get("ok"):
+                            print(f"[✗] HTTP weights upload failed: {resp.status} {j}")
+                        else:
+                            print(f"[✓] Weights accepted via HTTP ({len(body)} bytes)")
+            except Exception as e:
+                print(f"[✗] HTTP weights upload error: {e}")
+        elif model_type == "CNN" and len(weights_out) > 0 and CNN_UPLOAD_MODE == "bin":
             # One-shot binary upload (Float32) — much faster than JSON chunks.
             arr = np.asarray(weights_out, dtype=np.float32)
             payload = {
