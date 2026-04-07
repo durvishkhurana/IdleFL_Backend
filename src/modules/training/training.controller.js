@@ -39,8 +39,16 @@ export const startTraining = asyncHandler(async (req, res) => {
     if (!ext) {
       return res.status(400).json({ error: 'A .csv file is required for tabular models' })
     }
-    const csvText = file.buffer.toString('utf8')
-    const meta = extractTabularTrainingMetadata(csvText)
+    let meta
+    try {
+      const csvText = file.buffer.toString('utf8')
+      meta = extractTabularTrainingMetadata(csvText)
+    } catch (error) {
+      return res.status(400).json({
+        error: error?.message || 'Malformed CSV dataset',
+      })
+    }
+
     totalRows = meta.totalRows
     numFeatures = meta.numFeatures
     columnNames = meta.columnNames
