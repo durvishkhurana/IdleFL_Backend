@@ -31,6 +31,12 @@ DATASET_PATH = ""
 _LAST_LOCAL_SHARD = {}
 _LAST_SHARD_SIZE = {}
 
+# Local checkpoint cache directory (binary Float32 weights).
+CHECKPOINT_DIR = os.environ.get(
+    "IDLEFL_CHECKPOINT_DIR",
+    os.path.join(os.path.expanduser("~"), ".idlefl_checkpoints"),
+)
+
 # For demo purposes you can paste a JWT directly here instead of using login.
 # Leave empty to authenticate via POST /api/auth/agent-login at startup.
 JWT_TOKEN = ""
@@ -44,6 +50,11 @@ DEFAULT_LEARNING_RATE = 0.01
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_EPOCHS = 1
 MOCK_WEIGHT_SIZE = 16
+
+# CNN weights upload mode:
+# - "bin" (default): send Float32 bytes in one emit (fastest)
+# - "chunk": send JSON chunks (fallback)
+CNN_UPLOAD_MODE = os.environ.get("IDLEFL_CNN_UPLOAD_MODE", "bin").strip().lower()
 
 
 def detect_hardware():
@@ -130,6 +141,17 @@ def _emit_training_checkpoint(config, weights, iteration):
     round_num = config.get("roundNum")
     if not main_loop or not sio or task_id is None:
         return
+
+    # Best-effort local cache: speeds up reconnects without hitting server.
+    try:
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+        ckpt_path = os.path.join(CHECKPOINT_DIR, f"{job_id}_{task_id}.f32bin")
+        arr = np.asarray(weights, dtype=np.float32)
+        with open(ckpt_path, "wb") as f:
+            f.write(arr.tobytes(order="C"))
+    except Exception:
+        pass
+
     asyncio.run_coroutine_threadsafe(
         sio.emit(
             "training:checkpoint",
@@ -806,6 +828,7 @@ async def run_agent():
     print(f"  Connecting to {SERVER_URL}...\n")
 
     sio = socketio.AsyncClient(reconnection=True, reconnection_attempts=10, reconnection_delay=2)
+    _last_disconnect_at = 0.0
 
     # Shared state for the one-at-a-time checkpoint fetch handshake (agent-pull).
     _pending_checkpoint = {}
@@ -862,6 +885,8 @@ async def run_agent():
     @sio.event
     async def disconnect():
         print("[●] Disconnected from server")
+        nonlocal _last_disconnect_at
+        _last_disconnect_at = time.time()
 
     @sio.on("device:registered")
     async def on_device_registered(data):
@@ -918,9 +943,24 @@ async def run_agent():
 
         mu = float(_config_value(config, "proximal_mu", "mu", 0.0))
 
+        # Try local checkpoint first (fast path for normal reconnects).
+        local_ckpt = None
+        if task_id and job_id:
+            try:
+                ckpt_path = os.path.join(CHECKPOINT_DIR, f"{job_id}_{task_id}.f32bin")
+                if os.path.exists(ckpt_path):
+                    raw = await asyncio.to_thread(lambda p: open(p, "rb").read(), ckpt_path)
+                    if raw and (len(raw) % 4 == 0):
+                        local_ckpt = np.frombuffer(raw, dtype=np.float32).astype(float).tolist()
+            except Exception:
+                local_ckpt = None
+
         # Priority 1: use weights pre-loaded by server-push training:checkpoint_fetch (check 5 & 6).
         server_weights = _pending_checkpoints.pop(task_id, None) if task_id else None
-        if server_weights:
+        if local_ckpt:
+            config["globalWeights"] = local_ckpt
+            print(f"[✓] Using local checkpoint cache for task {task_id}: {len(local_ckpt)} weights")
+        elif server_weights:
             config["globalWeights"] = server_weights
             print(f"[✓] Using server-pushed checkpoint for task {task_id}: {len(server_weights)} weights")
         else:
@@ -928,7 +968,10 @@ async def run_agent():
             checkpoint_key = (
                 data.get("checkpointKey") or config.get("checkpointPath") or data.get("checkpointPath") or ""
             ).strip()
-            if checkpoint_key:
+            # Skip server fetch for normal reconnects; only fetch if this looks like a reassignment
+            # (checkpoint key present) AND we don't have a local cache.
+            recent_disconnect = (time.time() - _last_disconnect_at) < 60.0
+            if checkpoint_key and not recent_disconnect:
                 print(f"[●] Fetching checkpoint from server: {checkpoint_key}")
                 try:
                     # Prefer Socket.IO ack to avoid missing the response during reconnects.
@@ -943,6 +986,8 @@ async def run_agent():
                     print("[⚠] Checkpoint fetch timed out (15s) - training from scratch")
                 finally:
                     _pending_checkpoint.clear()
+            elif checkpoint_key and recent_disconnect:
+                print("[●] Recent reconnect detected — skipping server checkpoint fetch; training will resume from scratch unless local cache exists")
 
         if model_type in ("LINEAR_REGRESSION", "LOGISTIC_REGRESSION"):
             if shard.get("format") == "tabular" and "shardStart" in shard and "shardEnd" in shard:
@@ -995,12 +1040,31 @@ async def run_agent():
         weights_out = result.get("weights") or []
         print(f"[●] Sending weights ({len(weights_out)} floats)...")
 
-        if model_type == "CNN" and len(weights_out) > 0:
-            chunk_size = 10_000
+        if model_type == "CNN" and len(weights_out) > 0 and CNN_UPLOAD_MODE == "bin":
+            # One-shot binary upload (Float32) — much faster than JSON chunks.
+            arr = np.asarray(weights_out, dtype=np.float32)
+            await sio.emit(
+                "training:weights_ready",
+                {
+                    "jobId": job_id,
+                    "roundNum": round_num,
+                    "weightsBin": arr.tobytes(order="C"),
+                    "weightsDtype": "float32",
+                    "weightsLen": int(arr.size),
+                    "loss": result.get("loss"),
+                    "accuracy": result.get("accuracy"),
+                },
+            )
+            print(f"[✓] Weights sent (binary: {arr.nbytes} bytes)")
+        elif model_type == "CNN" and len(weights_out) > 0:
+            # Larger chunks = fewer emits = much faster (JSON overhead dominates).
+            # Tune via env var without editing the script.
+            chunk_size = int(os.environ.get("IDLEFL_WEIGHTS_CHUNK_SIZE", "50000"))
             total_chunks = (len(weights_out) + chunk_size - 1) // chunk_size
             for idx in range(total_chunks):
                 start = idx * chunk_size
                 end = min(len(weights_out), start + chunk_size)
+                is_last = idx == (total_chunks - 1)
                 await sio.emit(
                     "training:weights_ready",
                     {
@@ -1009,8 +1073,9 @@ async def run_agent():
                         "chunkIndex": idx,
                         "chunkTotal": total_chunks,
                         "weightsChunk": weights_out[start:end],
-                        "loss": result.get("loss"),
-                        "accuracy": result.get("accuracy"),
+                        # Send metrics once (last chunk) to reduce payload overhead.
+                        "loss": result.get("loss") if is_last else None,
+                        "accuracy": result.get("accuracy") if is_last else None,
                     },
                 )
             print(f"[✓] Weights sent (chunked: {total_chunks} chunks)")

@@ -11,6 +11,7 @@ const maxHttpBufferMb = parseInt(process.env.SOCKET_IO_MAX_HTTP_BUFFER_MB || '10
 const maxHttpBufferSize = Math.max(1, maxHttpBufferMb) * 1024 * 1024
 
 export function createSocketServer(httpServer) {
+  const websocketOnly = String(process.env.SOCKET_IO_WEBSOCKET_ONLY || 'true').toLowerCase() === 'true'
   const io = new Server(httpServer, {
     cors: {
       origin: process.env.CLIENT_URL || 'http://localhost:5173',
@@ -18,14 +19,14 @@ export function createSocketServer(httpServer) {
       credentials: true,
     },
     // Longer pings for slow clients / heavy GPU work between heartbeats (CNN rounds).
-    pingTimeout: parseInt(process.env.SOCKET_IO_PING_TIMEOUT_MS || '120000', 10),
+    pingTimeout: parseInt(process.env.SOCKET_IO_PING_TIMEOUT_MS || '180000', 10),
     pingInterval: parseInt(process.env.SOCKET_IO_PING_INTERVAL_MS || '30000', 10),
     maxHttpBufferSize,
-    transports: ['websocket', 'polling'],
+    transports: websocketOnly ? ['websocket'] : ['websocket', 'polling'],
   })
 
   logger.info(
-    `Socket.IO: maxHttpBufferSize=${maxHttpBufferMb}MB, pingTimeout=${parseInt(process.env.SOCKET_IO_PING_TIMEOUT_MS || '120000', 10)}ms`
+    `Socket.IO: maxHttpBufferSize=${maxHttpBufferMb}MB, pingTimeout=${parseInt(process.env.SOCKET_IO_PING_TIMEOUT_MS || '180000', 10)}ms, transports=${websocketOnly ? 'websocket' : 'websocket+polling'}`
   )
 
   io.use(socketAuthMiddleware)

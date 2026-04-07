@@ -564,7 +564,7 @@ export function registerTrainingHandlers(io, socket) {
       const {
         jobId,
         roundNum,
-        weights,
+        weights: weightsJson,
         loss,
         accuracy,
         skipped,
@@ -572,9 +572,19 @@ export function registerTrainingHandlers(io, socket) {
         chunkIndex,
         chunkTotal,
         weightsChunk,
+        // Binary one-shot uploads (preferred for CNN)
+        weightsBin,
+        weightsDtype,
+        weightsLen,
       } = payload
 
+      let weights = weightsJson
+      const hasBinary =
+        weightsBin != null &&
+        (Buffer.isBuffer(weightsBin) || weightsBin instanceof ArrayBuffer || ArrayBuffer.isView(weightsBin))
+
       const isChunked =
+        !hasBinary &&
         Number.isInteger(chunkIndex) &&
         Number.isInteger(chunkTotal) &&
         chunkTotal > 0 &&
@@ -673,6 +683,37 @@ export function registerTrainingHandlers(io, socket) {
         payload.accuracy = existing.accuracy ?? accuracy
       }
 
+      if (hasBinary) {
+        const dtype = String(weightsDtype || 'float32').toLowerCase()
+        if (dtype !== 'float32') {
+          logger.warn(`Ignoring binary weights with unsupported dtype=${dtype} from device ${socket.deviceId}`)
+          return
+        }
+
+        const buf = Buffer.isBuffer(weightsBin)
+          ? weightsBin
+          : Buffer.from(weightsBin.buffer || weightsBin)
+
+        if (buf.byteLength % 4 !== 0) {
+          logger.warn(
+            `Ignoring binary weights with invalid byteLength=${buf.byteLength} from device ${socket.deviceId}`
+          )
+          return
+        }
+
+        const floatCount = buf.byteLength / 4
+        if (Number.isInteger(weightsLen) && weightsLen > 0 && weightsLen !== floatCount) {
+          logger.warn(
+            `Binary weights length mismatch from device ${socket.deviceId}: expected=${weightsLen} got=${floatCount}`
+          )
+          return
+        }
+
+        const view = new Float32Array(buf.buffer, buf.byteOffset, floatCount)
+        // Redis stores JSON; keep same storage format as legacy path for now.
+        weights = Array.from(view)
+      }
+
       logger.info(`Weights received from device ${socket.deviceId}, job ${jobId}, round ${roundNum}`)
 
       const weightStore = await getRoundContributions(jobId, roundNum)
@@ -685,6 +726,10 @@ export function registerTrainingHandlers(io, socket) {
           shardSize: assignment.shardSize,
         })
       } else {
+        if (!Array.isArray(weights) || weights.length === 0) {
+          logger.warn(`Ignoring empty weights from device ${socket.deviceId} for job ${jobId} round ${roundNum}`)
+          return
+        }
         dedupedStore.push({
           deviceId: socket.deviceId,
           weights,
