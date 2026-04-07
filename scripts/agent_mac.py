@@ -56,6 +56,44 @@ MOCK_WEIGHT_SIZE = 16
 # - "bin": Socket.IO binary + ack
 # - "chunk": JSON chunks (fallback)
 CNN_UPLOAD_MODE = os.environ.get("IDLEFL_CNN_UPLOAD_MODE", "http").strip().lower()
+HTTP_WEIGHTS_RETRIES = max(1, int(os.environ.get("IDLEFL_HTTP_WEIGHTS_RETRIES", "5")))
+
+
+async def upload_cnn_weights_via_http(url, body, params, bearer_token):
+    """POST raw Float32 bytes with retries (handles transient TLS/proxy/keep-alive drops)."""
+    timeout = aiohttp.ClientTimeout(total=180, connect=45, sock_read=180)
+    headers = {
+        "Authorization": f"Bearer {bearer_token}",
+        "Content-Type": "application/octet-stream",
+        "Connection": "close",
+    }
+    last_err = None
+    for attempt in range(HTTP_WEIGHTS_RETRIES):
+        connector = aiohttp.TCPConnector(force_close=True)
+        try:
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector,
+                trust_env=False,
+            ) as http_sess:
+                async with http_sess.post(
+                    url,
+                    params=params or None,
+                    data=body,
+                    headers=headers,
+                ) as resp:
+                    try:
+                        j = await resp.json(content_type=None)
+                    except Exception:
+                        j = {"raw": (await resp.text())[:200]}
+                    if resp.status == 200 and j.get("ok"):
+                        return True, j
+                    last_err = f"HTTP {resp.status}: {j}"
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            last_err = str(e) or type(e).__name__
+        if attempt + 1 < HTTP_WEIGHTS_RETRIES:
+            await asyncio.sleep(min(2 ** attempt, 12))
+    return False, last_err
 
 
 def detect_hardware():
@@ -1052,28 +1090,11 @@ async def run_agent():
             if result.get("accuracy") is not None:
                 params["accuracy"] = str(result["accuracy"])
             url = f"{SERVER_URL.rstrip('/')}/api/training/{job_id}/round/{int(round_num)}/weights"
-            timeout = aiohttp.ClientTimeout(total=120)
-            try:
-                async with aiohttp.ClientSession(timeout=timeout) as http_sess:
-                    async with http_sess.post(
-                        url,
-                        params=params or None,
-                        data=body,
-                        headers={
-                            "Authorization": f"Bearer {http_auth_token}",
-                            "Content-Type": "application/octet-stream",
-                        },
-                    ) as resp:
-                        try:
-                            j = await resp.json(content_type=None)
-                        except Exception:
-                            j = {"raw": (await resp.text())[:200]}
-                        if resp.status != 200 or not j.get("ok"):
-                            print(f"[✗] HTTP weights upload failed: {resp.status} {j}")
-                        else:
-                            print(f"[✓] Weights accepted via HTTP ({len(body)} bytes)")
-            except Exception as e:
-                print(f"[✗] HTTP weights upload error: {e}")
+            ok, info = await upload_cnn_weights_via_http(url, body, params, http_auth_token)
+            if ok:
+                print(f"[✓] Weights accepted via HTTP ({len(body)} bytes)")
+            else:
+                print(f"[✗] HTTP weights upload failed after {HTTP_WEIGHTS_RETRIES} attempt(s): {info}")
         elif model_type == "CNN" and len(weights_out) > 0 and CNN_UPLOAD_MODE == "bin":
             # One-shot binary upload (Float32) — much faster than JSON chunks.
             arr = np.asarray(weights_out, dtype=np.float32)
