@@ -20,6 +20,21 @@ import { redis } from '../../config/redis.js'
  * @param {Array<{ shardSize?: number, loss?: number, accuracy?: number }>} contributions
  * @returns {{ avgLoss: number, avgAccuracy: number }}
  */
+/**
+ * Float32Array requires byteOffset % 4 === 0 on the underlying ArrayBuffer.
+ * Express `express.raw()` and some Redis clients return Buffer slices that are not aligned.
+ */
+function float32ArrayFromBuffer(buf) {
+  if (!Buffer.isBuffer(buf)) {
+    buf = Buffer.from(buf)
+  }
+  if (buf.byteLength % 4 !== 0) {
+    throw new Error(`Invalid buffer length ${buf.byteLength} (not multiple of 4)`)
+  }
+  const copy = Buffer.from(buf)
+  return new Float32Array(copy.buffer, copy.byteOffset, copy.byteLength / 4)
+}
+
 export function computeWeightedRoundMetrics(contributions) {
   const totalSamples = contributions.reduce((sum, c) => sum + (c.shardSize || 0), 0)
   if (totalSamples === 0) {
@@ -54,7 +69,7 @@ export async function fedAvgAggregate(weightContributions) {
       if (!buf || buf.byteLength % 4 !== 0) {
         throw new Error(`Invalid Redis vector for device ${contrib.deviceId}`)
       }
-      const view = new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4)
+      const view = float32ArrayFromBuffer(buf)
       if (Number.isInteger(contrib.weightsLen) && contrib.weightsLen > 0 && contrib.weightsLen !== view.length) {
         throw new Error(
           `Weight length mismatch: expected ${contrib.weightsLen}, got ${view.length} from device ${contrib.deviceId}`
@@ -67,7 +82,7 @@ export async function fedAvgAggregate(weightContributions) {
       if (buf.byteLength % 4 !== 0) {
         throw new Error(`Invalid binary weights byteLength=${buf.byteLength} from device ${contrib.deviceId}`)
       }
-      const view = new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4)
+      const view = float32ArrayFromBuffer(buf)
       if (Number.isInteger(contrib.weightsLen) && contrib.weightsLen > 0 && contrib.weightsLen !== view.length) {
         throw new Error(
           `Weight length mismatch: expected ${contrib.weightsLen}, got ${view.length} from device ${contrib.deviceId}`
