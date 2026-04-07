@@ -30,35 +30,60 @@ export function computeWeightedRoundMetrics(contributions) {
 }
 
 export function fedAvgAggregate(weightContributions) {
-  // weightContributions: Array of { weights: number[], shardSize: number, deviceId: string }
+  // weightContributions: Array of { weights?: number[], weightsBinB64?: string, weightsLen?: number, shardSize: number, deviceId: string }
   if (!weightContributions || weightContributions.length === 0) {
     throw new Error('No weight contributions to aggregate')
   }
 
   const totalSamples = weightContributions.reduce((sum, c) => sum + c.shardSize, 0)
-  const weightLength = weightContributions[0].weights.length
+
+  const decodeWeights = (contrib) => {
+    if (Array.isArray(contrib.weights)) {
+      return contrib.weights
+    }
+    if (typeof contrib.weightsBinB64 === 'string' && contrib.weightsBinB64.length > 0) {
+      const buf = Buffer.from(contrib.weightsBinB64, 'base64')
+      if (buf.byteLength % 4 !== 0) {
+        throw new Error(`Invalid binary weights byteLength=${buf.byteLength} from device ${contrib.deviceId}`)
+      }
+      const view = new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4)
+      if (Number.isInteger(contrib.weightsLen) && contrib.weightsLen > 0 && contrib.weightsLen !== view.length) {
+        throw new Error(
+          `Weight length mismatch: expected ${contrib.weightsLen}, got ${view.length} from device ${contrib.deviceId}`
+        )
+      }
+      return view
+    }
+    throw new Error(`Missing weights for device ${contrib.deviceId}`)
+  }
+
+  const first = decodeWeights(weightContributions[0])
+  const weightLength = first.length
 
   // Validate all weight vectors are the same length
   for (const contrib of weightContributions) {
-    if (contrib.weights.length !== weightLength) {
+    const w = decodeWeights(contrib)
+    if (w.length !== weightLength) {
       throw new Error(
-        `Weight length mismatch: expected ${weightLength}, got ${contrib.weights.length} from device ${contrib.deviceId}`
+        `Weight length mismatch: expected ${weightLength}, got ${w.length} from device ${contrib.deviceId}`
       )
     }
   }
 
   // Weighted average
-  const globalWeights = new Array(weightLength).fill(0)
+  // Use Float64 accumulation for numerical stability; convert to JS array at the end for JSON transport.
+  const acc = new Float64Array(weightLength)
 
   for (const contrib of weightContributions) {
     const proportion = contrib.shardSize / totalSamples
+    const w = decodeWeights(contrib)
     for (let i = 0; i < weightLength; i++) {
-      globalWeights[i] += proportion * contrib.weights[i]
+      acc[i] += proportion * w[i]
     }
   }
 
   return {
-    globalWeights,
+    globalWeights: Array.from(acc),
     totalSamples,
     numDevices: weightContributions.length,
   }

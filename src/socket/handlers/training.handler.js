@@ -738,9 +738,11 @@ export function registerTrainingHandlers(io, socket) {
           return
         }
 
-        const view = new Float32Array(buf.buffer, buf.byteOffset, floatCount)
-        // Redis stores JSON; keep same storage format as legacy path for now.
-        weights = Array.from(view)
+        // Avoid massive Array.from() that can block the event loop.
+        // Store as base64 and decode later during aggregation.
+        weights = null
+        payload._weightsBinB64 = buf.toString('base64')
+        payload._weightsLen = floatCount
       }
 
       logger.info(`Weights received from device ${socket.deviceId}, job ${jobId}, round ${roundNum}`)
@@ -755,14 +757,22 @@ export function registerTrainingHandlers(io, socket) {
           shardSize: assignment.shardSize,
         })
       } else {
-        if (!Array.isArray(weights) || weights.length === 0) {
+        const binB64 = payload._weightsBinB64
+        const binLen = payload._weightsLen
+        const isBinaryStored = typeof binB64 === 'string' && binB64.length > 0 && Number.isInteger(binLen) && binLen > 0
+
+        if (!isBinaryStored && (!Array.isArray(weights) || weights.length === 0)) {
           logger.warn(`Ignoring empty weights from device ${socket.deviceId} for job ${jobId} round ${roundNum}`)
           ackErr('empty_weights')
           return
         }
+
+        // Ack early so agents don't time out while we write DB/Redis.
+        ackOk({ received: true })
+
         dedupedStore.push({
           deviceId: socket.deviceId,
-          weights,
+          ...(isBinaryStored ? { weightsBinB64: binB64, weightsLen: binLen } : { weights }),
           shardSize: assignment.shardSize,
           loss,
           accuracy,
@@ -791,7 +801,11 @@ export function registerTrainingHandlers(io, socket) {
       await redis.del(REDIS_KEYS.deviceTask(socket.deviceId))
 
       io.to(job.sessionId).emit('device:status_update', { deviceId: socket.deviceId, status: 'ACTIVE' })
-      ackOk({ stored: true, weightsLen: Array.isArray(weights) ? weights.length : 0 })
+      ackOk({
+        stored: true,
+        weightsLen: Array.isArray(weights) ? weights.length : payload._weightsLen || 0,
+        binary: typeof payload._weightsBinB64 === 'string',
+      })
 
       const totalAssigned = job.taskAssignments.length
       const existing = roundState.get(jobId)
