@@ -24,7 +24,6 @@ export const startTraining = asyncHandler(async (req, res) => {
   }
 
   const file = req.file
-  const demoMode = process.env.DEMO_MODE === 'true'
 
   let datasetPath = null
   let totalRows = null
@@ -32,31 +31,29 @@ export const startTraining = asyncHandler(async (req, res) => {
   let columnNames = null
   let datasetHash = null
 
-  if (!demoMode) {
-    if (modelType === 'LINEAR_REGRESSION' || modelType === 'LOGISTIC_REGRESSION') {
-      if (!file) {
-        return res.status(400).json({ error: 'CSV dataset file is required for this model type' })
-      }
-      const ext = file.originalname.toLowerCase().endsWith('.csv')
-      if (!ext) {
-        return res.status(400).json({ error: 'A .csv file is required for tabular models' })
-      }
-      const csvText = file.buffer.toString('utf8')
-      const meta = extractTabularTrainingMetadata(csvText)
-      totalRows = meta.totalRows
-      numFeatures = meta.numFeatures
-      columnNames = meta.columnNames
-      datasetHash = createHash('sha256').update(file.buffer).digest('hex')
-    } else if (modelType === 'CNN') {
-      if (!file) {
-        return res.status(400).json({ error: 'ZIP dataset file is required for CNN' })
-      }
-      if (!file.originalname.toLowerCase().endsWith('.zip')) {
-        return res.status(400).json({ error: 'A .zip file is required for CNN' })
-      }
-      datasetPath = file.originalname
-      datasetHash = createHash('sha256').update(file.buffer).digest('hex')
+  if (modelType === 'LINEAR_REGRESSION' || modelType === 'LOGISTIC_REGRESSION') {
+    if (!file) {
+      return res.status(400).json({ error: 'CSV dataset file is required for this model type' })
     }
+    const ext = file.originalname.toLowerCase().endsWith('.csv')
+    if (!ext) {
+      return res.status(400).json({ error: 'A .csv file is required for tabular models' })
+    }
+    const csvText = file.buffer.toString('utf8')
+    const meta = extractTabularTrainingMetadata(csvText)
+    totalRows = meta.totalRows
+    numFeatures = meta.numFeatures
+    columnNames = meta.columnNames
+    datasetHash = createHash('sha256').update(file.buffer).digest('hex')
+  } else if (modelType === 'CNN') {
+    if (!file) {
+      return res.status(400).json({ error: 'ZIP dataset file is required for CNN' })
+    }
+    if (!file.originalname.toLowerCase().endsWith('.zip')) {
+      return res.status(400).json({ error: 'A .zip file is required for CNN' })
+    }
+    datasetPath = file.originalname
+    datasetHash = createHash('sha256').update(file.buffer).digest('hex')
   }
 
   const result = await trainingService.startTraining({
@@ -111,5 +108,12 @@ export const downloadModel = asyncHandler(async (req, res) => {
   res.setHeader('Content-Disposition', `attachment; filename="idlefl_model_${job.id}.json"`)
 
   const stream = createReadStream(job.modelPath)
+  stream.on('error', (err) => {
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to read model file' })
+    } else {
+      res.destroy(err)
+    }
+  })
   stream.pipe(res)
 })

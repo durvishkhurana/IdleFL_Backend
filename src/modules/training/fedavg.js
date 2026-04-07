@@ -63,21 +63,3 @@ export function fedAvgAggregate(weightContributions) {
     numDevices: weightContributions.length,
   }
 }
-
-// Mock weight generation for simulation/demo mode
-export function generateMockWeights(modelType, round) {
-  const sizes = {
-    LINEAR_REGRESSION: 10,
-    LOGISTIC_REGRESSION: 50,
-    CNN: 200,
-  }
-
-  const size = sizes[modelType] || 50
-  const weights = Array.from({ length: size }, () => (Math.random() - 0.5) * 0.1)
-
-  const noise = () => (Math.random() - 0.5) * 0.05
-  const loss = Math.max(0.05, 1.2 * Math.exp(-0.3 * round) + noise())
-  const accuracy = Math.min(0.98, 0.4 + 0.55 * (1 - Math.exp(-0.35 * round)) + noise())
-
-  return { weights, loss, accuracy }
-}

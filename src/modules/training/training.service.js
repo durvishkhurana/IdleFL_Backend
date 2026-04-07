@@ -2,7 +2,7 @@ import { prisma } from '../../config/database.js'
 import { redis, REDIS_KEYS } from '../../config/redis.js'
 import { filterEligibleDevices } from '../../utils/deviceScoring.js'
 import { partitionDataset } from '../../utils/dataPartitioner.js'
-import { computeWeightedRoundMetrics, fedAvgAggregate, generateMockWeights } from './fedavg.js'
+import { computeWeightedRoundMetrics, fedAvgAggregate } from './fedavg.js'
 import { logger } from '../../config/logger.js'
 import { config as appConfig } from '../../config/app.js'
 import { epochsForModelType } from './training.constants.js'
@@ -135,20 +135,18 @@ export class TrainingService {
 
     await prisma.session.update({ where: { id: sessionId }, data: { status: 'TRAINING' } })
 
-    if (process.env.DEMO_MODE !== 'true') {
-      await this.dispatchRound({
-        jobId: job.id,
-        sessionId,
-        modelType,
-        datasetPath: job.datasetPath,
-        totalRows: job.totalRows,
-        learningRate: parsedLearningRate,
-        batchSize: parsedBatchSize,
-        roundNum: 1,
-        globalWeights: null,
-        devices: eligible,
-      })
-    }
+    await this.dispatchRound({
+      jobId: job.id,
+      sessionId,
+      modelType,
+      datasetPath: job.datasetPath,
+      totalRows: job.totalRows,
+      learningRate: parsedLearningRate,
+      batchSize: parsedBatchSize,
+      roundNum: 1,
+      globalWeights: null,
+      devices: eligible,
+    })
 
     this.io.to(sessionId).emit('training:started', {
       jobId: job.id,
@@ -160,81 +158,7 @@ export class TrainingService {
 
     logger.info(`Training started: job ${job.id}, session ${sessionId}, ${eligible.length} devices`)
 
-    if (process.env.DEMO_MODE === 'true') {
-      this.runDemoTrainingLoop(job, eligible, sessionId)
-    }
-
     return { job, eligibleDevices: eligible.length }
-  }
-
-  // Demo mode: simulates a full training run with mock weights
-  async runDemoTrainingLoop(job, devices, sessionId) {
-    const { numRounds, modelType } = job
-    let currentRound = 0
-
-    const tick = async () => {
-      if (currentRound >= numRounds) {
-        await this.completeJob(job.id, sessionId)
-        return
-      }
-
-      currentRound++
-      logger.info(`Demo training: job ${job.id}, round ${currentRound}/${numRounds}`)
-
-      for (const device of devices) {
-        this.io.to(sessionId).emit('device:status_update', {
-          deviceId: device.id,
-          status: 'TRAINING',
-          round: currentRound,
-        })
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 2500))
-
-      const contributions = devices.map((d) => {
-        const { weights, loss, accuracy } = generateMockWeights(modelType, currentRound)
-        return { deviceId: d.id, weights, shardSize: Math.floor(1000 / devices.length), loss, accuracy }
-      })
-
-      const { globalWeights } = fedAvgAggregate(contributions)
-      const { avgLoss, avgAccuracy } = computeWeightedRoundMetrics(contributions)
-
-      await prisma.trainingRound.create({
-        data: { jobId: job.id, roundNum: currentRound, loss: avgLoss, accuracy: avgAccuracy, duration: 2.5 },
-      })
-
-      await prisma.trainingJob.update({ where: { id: job.id }, data: { currentRound } })
-
-      const totalShard = contributions.reduce((s, c) => s + c.shardSize, 0)
-
-      this.io.to(sessionId).emit('training:round_complete', {
-        jobId: job.id,
-        round: currentRound,
-        totalRounds: numRounds,
-        loss: parseFloat(avgLoss.toFixed(4)),
-        accuracy: parseFloat(avgAccuracy.toFixed(4)),
-        deviceContributions: devices.map((d, i) => {
-          const shardSize = contributions[i]?.shardSize ?? 0
-          return {
-            deviceId: d.id,
-            name: d.deviceName,
-            computeType: d.computeType,
-            os: d.os,
-            samples: shardSize,
-            shardSize,
-            contribution: totalShard > 0 ? shardSize / totalShard : 1 / devices.length,
-          }
-        }),
-      })
-
-      for (const device of devices) {
-        this.io.to(sessionId).emit('device:status_update', { deviceId: device.id, status: 'ACTIVE' })
-      }
-
-      setTimeout(tick, 1000)
-    }
-
-    setTimeout(tick, 1500)
   }
 
   async completeJob(jobId, sessionId) {

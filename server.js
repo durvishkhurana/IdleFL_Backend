@@ -52,7 +52,6 @@ async function bootstrap() {
     logger.info(`  ✓ WS     → ws://localhost:${PORT}`)
     logger.info(`  ✓ Health → http://localhost:${PORT}/health`)
     logger.info(`  ✓ Mode   → ${process.env.NODE_ENV || 'development'}`)
-    logger.info(`  ✓ Demo   → ${process.env.DEMO_MODE === 'true' ? 'ON' : 'OFF'}`)
     logger.info(``)
   })
 
