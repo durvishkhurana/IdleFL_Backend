@@ -930,20 +930,17 @@ async def run_agent():
             ).strip()
             if checkpoint_key:
                 print(f"[●] Fetching checkpoint from server: {checkpoint_key}")
-                evt = asyncio.Event()
-                _pending_checkpoint["event"] = evt
-                _pending_checkpoint["weights"] = None
-                await sio.emit("training:checkpoint_fetch", {"checkpointKey": checkpoint_key})
                 try:
-                    await asyncio.wait_for(evt.wait(), timeout=5.0)
-                    received_weights = _pending_checkpoint.get("weights")
+                    # Prefer Socket.IO ack to avoid missing the response during reconnects.
+                    resp = await sio.call("training:checkpoint_fetch", {"checkpointKey": checkpoint_key}, timeout=15.0)
+                    received_weights = (resp or {}).get("weights")
                     if received_weights:
                         config["globalWeights"] = received_weights
                         print(f"[✓] Checkpoint loaded: {len(received_weights)} weights")
                     else:
                         print("[⚠] Checkpoint payload empty - training from scratch")
                 except asyncio.TimeoutError:
-                    print("[⚠] Checkpoint fetch timed out (5s) - training from scratch")
+                    print("[⚠] Checkpoint fetch timed out (15s) - training from scratch")
                 finally:
                     _pending_checkpoint.clear()
 

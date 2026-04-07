@@ -819,28 +819,36 @@ export function registerTrainingHandlers(io, socket) {
     }
   })
 
-  socket.on('training:checkpoint_fetch', async ({ checkpointPath, checkpointKey }) => {
+  socket.on('training:checkpoint_fetch', async ({ checkpointPath, checkpointKey } = {}, ack) => {
     try {
       const key = checkpointKey || checkpointPath
       if (!key) {
-        socket.emit('training:checkpoint_data', { weights: null, error: 'no_path' })
+        const payload = { weights: null, error: 'no_path' }
+        if (typeof ack === 'function') ack(payload)
+        socket.emit('training:checkpoint_data', payload)
         return
       }
 
       const raw = await redis.get(key)
       if (!raw) {
-        socket.emit('training:checkpoint_data', { weights: null, error: 'not_found' })
+        const payload = { weights: null, error: 'not_found' }
+        if (typeof ack === 'function') ack(payload)
+        socket.emit('training:checkpoint_data', payload)
         logger.warn(`Checkpoint not found in Redis: ${key}`)
         return
       }
 
       const parsed = JSON.parse(raw)
       const weights = parsed?.weights || parsed?.checkpointData || null
-      socket.emit('training:checkpoint_data', { weights })
+      const payload = { weights }
+      if (typeof ack === 'function') ack(payload)
+      socket.emit('training:checkpoint_data', payload)
       logger.debug(`Checkpoint fetched for device ${socket.deviceId}: ${key}`)
     } catch (error) {
       logger.error('training:checkpoint_fetch error:', error)
-      socket.emit('training:checkpoint_data', { weights: null, error: 'fetch_failed' })
+      const payload = { weights: null, error: 'fetch_failed' }
+      if (typeof ack === 'function') ack(payload)
+      socket.emit('training:checkpoint_data', payload)
     }
   })
 
