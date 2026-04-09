@@ -52,49 +52,9 @@ DEFAULT_EPOCHS = 1
 MOCK_WEIGHT_SIZE = 16
 
 # CNN weights upload mode:
-# - "http" (default): POST raw Float32 to /api/training/:jobId/round/:n/weights (most reliable on Render)
-# - "bin": Socket.IO binary + ack
+# - "bin" (default): Socket.IO binary + server ack
 # - "chunk": JSON chunks (fallback)
-CNN_UPLOAD_MODE = os.environ.get("IDLEFL_CNN_UPLOAD_MODE", "http").strip().lower()
-# Windows + TLS often hits "Server disconnected" on large POSTs; retries + fresh connector help.
-HTTP_WEIGHTS_RETRIES = max(1, int(os.environ.get("IDLEFL_HTTP_WEIGHTS_RETRIES", "5")))
-
-
-async def upload_cnn_weights_via_http(url, body, params, bearer_token):
-    """POST raw Float32 bytes with retries (handles transient TLS/proxy/keep-alive drops on Windows)."""
-    timeout = aiohttp.ClientTimeout(total=180, connect=45, sock_read=180)
-    headers = {
-        "Authorization": f"Bearer {bearer_token}",
-        "Content-Type": "application/octet-stream",
-        "Connection": "close",
-    }
-    last_err = None
-    for attempt in range(HTTP_WEIGHTS_RETRIES):
-        connector = aiohttp.TCPConnector(force_close=True)
-        try:
-            async with aiohttp.ClientSession(
-                timeout=timeout,
-                connector=connector,
-                trust_env=False,
-            ) as http_sess:
-                async with http_sess.post(
-                    url,
-                    params=params or None,
-                    data=body,
-                    headers=headers,
-                ) as resp:
-                    try:
-                        j = await resp.json(content_type=None)
-                    except Exception:
-                        j = {"raw": (await resp.text())[:200]}
-                    if resp.status == 200 and j.get("ok"):
-                        return True, j
-                    last_err = f"HTTP {resp.status}: {j}"
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-            last_err = str(e) or type(e).__name__
-        if attempt + 1 < HTTP_WEIGHTS_RETRIES:
-            await asyncio.sleep(min(2 ** attempt, 12))
-    return False, last_err
+CNN_UPLOAD_MODE = os.environ.get("IDLEFL_CNN_UPLOAD_MODE", "bin").strip().lower()
 
 
 def detect_hardware():
@@ -865,8 +825,6 @@ async def run_agent():
             print(f"    Server response: {body.get('error', 'unknown error')}")
             return
 
-    http_auth_token = token
-
     print(f"  Connecting to {SERVER_URL}...\n")
 
     sio = socketio.AsyncClient(reconnection=True, reconnection_attempts=10, reconnection_delay=2)
@@ -968,6 +926,13 @@ async def run_agent():
 
     @sio.on("training:task_assigned")
     async def on_task_assigned(data):
+        try:
+            await _handle_task_assigned(data)
+        except Exception as e:
+            # Never let an exception inside a Socket.IO handler kill the agent coroutine.
+            print(f"[✗] Task handler crashed: {e} — agent still alive, waiting for reassignment")
+
+    async def _handle_task_assigned(data):
         job_id = data.get("jobId")
         round_num = data.get("roundNum")
         task_id = data.get("taskId")
@@ -1082,21 +1047,7 @@ async def run_agent():
         weights_out = result.get("weights") or []
         print(f"[●] Sending weights ({len(weights_out)} floats)...")
 
-        if model_type == "CNN" and len(weights_out) > 0 and CNN_UPLOAD_MODE == "http":
-            arr = np.asarray(weights_out, dtype=np.float32)
-            body = arr.tobytes(order="C")
-            params = {}
-            if result.get("loss") is not None:
-                params["loss"] = str(result["loss"])
-            if result.get("accuracy") is not None:
-                params["accuracy"] = str(result["accuracy"])
-            url = f"{SERVER_URL.rstrip('/')}/api/training/{job_id}/round/{int(round_num)}/weights"
-            ok, info = await upload_cnn_weights_via_http(url, body, params, http_auth_token)
-            if ok:
-                print(f"[✓] Weights accepted via HTTP ({len(body)} bytes)")
-            else:
-                print(f"[✗] HTTP weights upload failed after {HTTP_WEIGHTS_RETRIES} attempt(s): {info}")
-        elif model_type == "CNN" and len(weights_out) > 0 and CNN_UPLOAD_MODE == "bin":
+        if model_type == "CNN" and len(weights_out) > 0 and CNN_UPLOAD_MODE == "bin":
             # One-shot binary upload (Float32) — much faster than JSON chunks.
             arr = np.asarray(weights_out, dtype=np.float32)
             payload = {
@@ -1110,19 +1061,22 @@ async def run_agent():
             }
             # Use ack so we *know* the server stored it. If disconnected mid-upload, retry once.
             try:
-                resp = await sio.call("training:weights_ready", payload, timeout=60.0)
+                resp = await sio.call("training:weights_ready", payload, timeout=120.0)
                 if not (resp or {}).get("ok", False):
                     raise RuntimeError(f"server_nack: {resp}")
                 print(f"[✓] Weights accepted by server (binary: {arr.nbytes} bytes)")
             except Exception as e:
-                print(f"[⚠] Weights upload did not ack ({e}) — waiting for reconnect then retrying once")
+                print(f"[⚠] Weights upload did not ack ({e}) — waiting 10s then retrying once")
+                # If the server is just slow (e.g., free dyno), give it time to finish processing
+                # the first attempt even if the ack was delayed/lost.
+                await asyncio.sleep(10.0)
                 # Wait until reconnected (max 30s)
                 deadline = time.time() + 30.0
                 while (not sio.connected) and time.time() < deadline:
                     await asyncio.sleep(0.25)
                 if sio.connected:
                     try:
-                        resp = await sio.call("training:weights_ready", payload, timeout=60.0)
+                        resp = await sio.call("training:weights_ready", payload, timeout=120.0)
                         if not (resp or {}).get("ok", False):
                             raise RuntimeError(f"server_nack: {resp}")
                         print(f"[✓] Weights accepted by server after retry (binary: {arr.nbytes} bytes)")
@@ -1209,6 +1163,15 @@ async def run_agent():
             if sio.connected:
                 stats = get_stats()
                 await sio.emit("heartbeat", {**stats, "computeType": compute_type})
+                # Ping HTTP health endpoint to prevent Render free dyno sleep.
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        await session.get(
+                            SERVER_URL.replace("wss://", "https://").replace("ws://", "http://") + "/health",
+                            timeout=aiohttp.ClientTimeout(total=5),
+                        )
+                except Exception:
+                    pass  # non-critical
 
     await sio.connect(SERVER_URL, auth={"token": token}, transports=["websocket"])
     asyncio.create_task(heartbeat_loop())

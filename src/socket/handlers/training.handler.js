@@ -18,6 +18,93 @@ const AGG_LOCK_TTL_SECONDS = 120
 const roundState = new Map()
 // Key: jobId, Value: { roundNum: number, submitted: string[], totalAssigned: number, timer: any }
 
+/**
+ * Called when a device reconnects after a server restart. If the in-memory roundState/timer
+ * was lost mid-round, rebuild it from Redis contributions (or trigger aggregation if the
+ * participation threshold is already met).
+ * @param {import('socket.io').Server} io
+ * @param {string} jobId
+ */
+export async function recoverStuckRoundIfNeeded(io, jobId) {
+  if (!jobId) return
+  // Skip if we still have in-memory state (process was not restarted).
+  if (roundState.has(jobId)) return
+
+  const job = await prisma.trainingJob.findUnique({
+    where: { id: jobId },
+    include: {
+      session: true,
+    },
+  })
+  if (!job || job.status !== 'RUNNING') return
+
+  const roundNum = job.currentRound
+
+  // Re-query assignments for the active round only.
+  const assignments = await prisma.taskAssignment.findMany({
+    where: {
+      jobId,
+      roundNum,
+      status: { in: ['PENDING', 'IN_PROGRESS', 'COMPLETED'] },
+    },
+    select: { deviceId: true },
+  })
+  const totalAssigned = assignments.length
+  if (totalAssigned === 0) return
+
+  const contributions = await getRoundContributions(jobId, roundNum)
+  const validContributions = (contributions || []).filter(
+    (c) => !c?.skipped && (Array.isArray(c?.weights) || typeof c?.weightsBlobKey === 'string')
+  )
+
+  logger.info(
+    `Recovery check: job ${jobId} round ${roundNum} — ${validContributions.length}/${totalAssigned} contributions in Redis`
+  )
+
+  const needed = Math.ceil(totalAssigned * PARTICIPATION_THRESHOLD)
+  if (validContributions.length >= needed) {
+    logger.info(
+      `Recovery: participation threshold met for job ${jobId} round ${roundNum} — triggering aggregation`
+    )
+    await finalizeAggregatedRound(io, jobId, roundNum, {
+      allowEarly: true,
+      participatingDevices: validContributions.length,
+      assignedDevices: totalAssigned,
+    })
+    return
+  }
+
+  // Threshold not met — restart the timeout timer so the round can still complete.
+  const state = {
+    roundNum,
+    submitted: validContributions.map((c) => c.deviceId).filter(Boolean),
+    totalAssigned,
+    timer: null,
+  }
+
+  state.timer = setTimeout(async () => {
+    try {
+      const st = roundState.get(jobId)
+      if (st && st.roundNum === roundNum && st.submitted.length > 0) {
+        logger.info(`Recovery timeout fired for job ${jobId} round ${roundNum}`)
+        await finalizeAggregatedRound(io, jobId, roundNum, {
+          allowEarly: true,
+          participatingDevices: st.submitted.length,
+          assignedDevices: st.totalAssigned,
+        })
+        roundState.delete(jobId)
+      }
+    } catch (e) {
+      logger.error(`Recovery timeout error for job ${jobId}:`, e)
+    }
+  }, ROUND_TIMEOUT_SECONDS * 1000)
+
+  roundState.set(jobId, state)
+  logger.info(
+    `Recovery: restarted timeout timer for job ${jobId} round ${roundNum} (${ROUND_TIMEOUT_SECONDS}s)`
+  )
+}
+
 async function getWeightsChunkState(jobId, roundNum, deviceId) {
   const raw = await redis.get(REDIS_KEYS.jobWeightsChunk(jobId, roundNum, deviceId))
   return raw ? JSON.parse(raw) : null
@@ -814,14 +901,21 @@ export function registerTrainingHandlers(io, socket) {
       }
 
       if (job.status !== 'RUNNING') {
+        if (job.status === 'AGGREGATING' || job.status === 'COMPLETED') {
+          // The round likely already advanced; ack success so agents don't retry/crash on timeout.
+          ackOk({ stored: false, alreadyAggregated: true })
+          return
+        }
         logger.warn(`Ignoring weights for job ${jobId} in status ${job.status}`)
         ackErr('job_not_running')
         return
       }
 
       if (job.currentRound !== roundNum) {
-        logger.warn(`Ignoring stale weights for job ${jobId}: expected round ${job.currentRound}, received ${roundNum}`)
-        ackErr('stale_round')
+        logger.info(
+          `Stale weights from device ${socket.deviceId} for job ${jobId}: round ${roundNum} already completed (current: ${job.currentRound}) — acking ok`
+        )
+        ackOk({ stored: false, alreadyAggregated: true })
         return
       }
 

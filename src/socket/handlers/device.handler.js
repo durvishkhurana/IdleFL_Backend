@@ -2,7 +2,7 @@ import { prisma } from '../../config/database.js'
 import { redis, REDIS_KEYS } from '../../config/redis.js'
 import { scoreDevice } from '../../utils/deviceScoring.js'
 import { logger } from '../../config/logger.js'
-import { reassignDroppedDeviceTrainingTask } from './training.handler.js'
+import { reassignDroppedDeviceTrainingTask, recoverStuckRoundIfNeeded } from './training.handler.js'
 
 export function registerDeviceHandlers(io, socket) {
   const { user } = socket
@@ -78,6 +78,20 @@ export function registerDeviceHandlers(io, socket) {
           os: device.os,
           computeType: resolvedComputeType,
         })
+
+        // Device is reconnecting — if this process restarted mid-round, the in-memory round timer
+        // may be lost. If the device still has an assigned job in Redis, attempt round recovery.
+        const taskRaw = await redis.get(REDIS_KEYS.deviceTask(device.id))
+        if (taskRaw) {
+          try {
+            const task = JSON.parse(taskRaw)
+            if (task?.jobId) {
+              await recoverStuckRoundIfNeeded(io, task.jobId)
+            }
+          } catch {
+            // ignore
+          }
+        }
       }
     } catch (error) {
       logger.error('device:register error:', error)
