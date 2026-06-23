@@ -3,6 +3,8 @@ import { access } from 'fs/promises'
 import { constants as fsConstants } from 'fs'
 import { asyncHandler } from '../../utils/asyncHandler.js'
 import { ingestRoundWeightsHttp } from '../../socket/handlers/training.handler.js'
+import { prisma } from '../../config/database.js'
+import { redis, REDIS_KEYS } from '../../config/redis.js'
 
 // TrainingService is instantiated with the io instance in server.js, injected here
 let trainingService
@@ -37,6 +39,43 @@ export const submitAgentWeights = asyncHandler(async (req, res) => {
   }
 
   return res.status(200).json({ ok: true, weightsLen: result.weightsLen })
+})
+
+/** Federated global weights for round 2+ (large — use HTTP, not Socket.IO ack). */
+export const getAgentGlobalWeights = asyncHandler(async (req, res) => {
+  const { jobId } = req.params
+  const job = await prisma.trainingJob.findUnique({
+    where: { id: jobId },
+    select: { id: true, sessionId: true, status: true },
+  })
+  if (!job) {
+    return res.status(404).json({ error: 'job_not_found' })
+  }
+
+  const device = await prisma.device.findFirst({
+    where: { userId: req.user.id, sessionId: job.sessionId },
+    select: { id: true },
+  })
+  if (!device) {
+    return res.status(403).json({ error: 'not_session_device' })
+  }
+
+  const raw = await redis.get(REDIS_KEYS.jobGlobalWeights(jobId))
+  if (!raw) {
+    return res.status(404).json({ error: 'global_weights_not_ready' })
+  }
+
+  let weights
+  try {
+    weights = JSON.parse(raw)
+  } catch {
+    return res.status(500).json({ error: 'invalid_weights_blob' })
+  }
+  if (!Array.isArray(weights)) {
+    return res.status(500).json({ error: 'invalid_weights_format' })
+  }
+
+  return res.status(200).json({ ok: true, weights, length: weights.length })
 })
 
 export const startTraining = asyncHandler(async (req, res) => {
