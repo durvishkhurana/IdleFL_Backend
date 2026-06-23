@@ -102,7 +102,9 @@ export function registerDeviceHandlers(io, socket) {
           }
         }
 
-        await redeliverInProgressTaskForDevice(io, device.id)
+        await redeliverInProgressTaskForDevice(io, device.id).catch((err) => {
+          logger.error(`redeliverInProgressTaskForDevice failed for ${device.id}:`, err)
+        })
       }
     } catch (error) {
       logger.error('device:register error:', error)

@@ -8,6 +8,24 @@ import { epochsForModelType } from './training.constants.js'
 
 let activeTrainingService = null
 
+/** Avoid multi-MB globalWeights on Socket.IO (CNN round 2+ on Render). */
+const CNN_SOCKET_WEIGHT_MAX = parseInt(process.env.CNN_SOCKET_WEIGHT_MAX || '5000', 10)
+
+function packageGlobalWeightsForEmit({ modelType, jobId, globalWeights }) {
+  if (
+    modelType !== 'CNN' ||
+    !Array.isArray(globalWeights) ||
+    globalWeights.length === 0 ||
+    globalWeights.length <= CNN_SOCKET_WEIGHT_MAX
+  ) {
+    return { globalWeights, checkpointKey: null }
+  }
+  return {
+    globalWeights: [],
+    checkpointKey: REDIS_KEYS.jobGlobalWeights(jobId),
+  }
+}
+
 /**
  * @param {import('socket.io').Server} io
  * @param {Object} opts
@@ -38,25 +56,29 @@ export function emitTrainingTaskAssigned(io, opts) {
       : { shardStart: shard.shardStart, shardEnd: shard.shardEnd, shardSize: shard.shardSize, format: 'tabular' }
 
   const cp = checkpointPath ?? assignment?.checkpointPath ?? ''
+  const packaged = packageGlobalWeightsForEmit({ modelType, jobId, globalWeights })
+  const weightsForSocket = packaged.globalWeights
+  const agentCheckpointKey = packaged.checkpointKey || cp || ''
 
   io.to(device.socketId).emit('training:task_assigned', {
     taskId: assignment.id,
     jobId,
     roundNum,
     modelType,
+    checkpointKey: packaged.checkpointKey || undefined,
     config: {
       learningRate,
       batchSize,
       epochs,
-      globalWeights,
+      globalWeights: weightsForSocket,
       mu: mu ?? 0.01,
       proximal_mu: mu ?? 0.01,
       checkpointInterval: appConfig.checkpointInterval,
       learning_rate: learningRate,
       batch_size: batchSize,
-      global_weights: globalWeights,
+      global_weights: weightsForSocket,
       round_num: roundNum,
-      checkpointPath: cp,
+      checkpointPath: agentCheckpointKey,
     },
     shard: shardPayload,
   })

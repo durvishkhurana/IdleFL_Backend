@@ -46,6 +46,13 @@ async function checkForTimedOutDevices(io) {
       continue
     }
 
+    const inProgressTasks = await prisma.taskAssignment.count({
+      where: { deviceId: device.id, status: 'IN_PROGRESS' },
+    })
+    if (inProgressTasks > 0) {
+      continue
+    }
+
     logger.warn(`Device timed out: ${device.id} (${device.deviceName}) in session ${device.session?.sessionCode}`)
 
     const droppedDevice = await prisma.device.update({

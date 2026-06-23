@@ -123,7 +123,7 @@ export async function redeliverInProgressTaskForDevice(io, deviceId) {
   const assignment = await prisma.taskAssignment.findFirst({
     where: { deviceId, status: 'IN_PROGRESS' },
     include: { job: true },
-    orderBy: { createdAt: 'desc' },
+    orderBy: { assignedAt: 'desc' },
   })
   if (!assignment?.job || assignment.job.status !== 'RUNNING') return
   if (assignment.job.currentRound !== assignment.roundNum) return
@@ -765,7 +765,7 @@ export async function ingestRoundWeightsHttp(io, { userId, jobId, roundNum, body
 
   await prisma.device.update({
     where: { id: device.id },
-    data: { status: 'ACTIVE', activeTasks: 0 },
+    data: { status: 'ACTIVE', activeTasks: 0, lastHeartbeat: new Date() },
   })
 
   const redisDevice = await redis.get(REDIS_KEYS.device(device.id))
@@ -1261,7 +1261,9 @@ export function registerTrainingHandlers(io, socket) {
       }
 
       const parsed = JSON.parse(raw)
-      const weights = parsed?.weights || parsed?.checkpointData || null
+      const weights = Array.isArray(parsed)
+        ? parsed
+        : parsed?.weights || parsed?.checkpointData || null
       const payload = { weights }
       if (typeof ack === 'function') ack(payload)
       socket.emit('training:checkpoint_data', payload)
