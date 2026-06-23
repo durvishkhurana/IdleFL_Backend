@@ -128,6 +128,17 @@ export async function redeliverInProgressTaskForDevice(io, deviceId) {
   if (!assignment?.job || assignment.job.status !== 'RUNNING') return
   if (assignment.job.currentRound !== assignment.roundNum) return
 
+  const contributions = await getRoundContributions(assignment.jobId, assignment.roundNum)
+  const alreadySubmitted = contributions.some(
+    (c) => c.deviceId === deviceId && !c.skipped && (c.weightsBlobKey || c.weights?.length)
+  )
+  if (alreadySubmitted) {
+    logger.info(
+      `Skip redeliver for device ${deviceId}: round ${assignment.roundNum} weights already received`
+    )
+    return
+  }
+
   const job = assignment.job
 
   let globalWeights = null
@@ -739,6 +750,13 @@ export async function ingestRoundWeightsHttp(io, { userId, jobId, roundNum, body
     return { ok: false, status: 403, error: 'no_assignment' }
   }
 
+  if (assignment.status === 'COMPLETED') {
+    logger.info(
+      `Duplicate HTTP weights ignored for device ${device.id}, job ${jobId}, round ${roundNum}`
+    )
+    return { ok: true, status: 200, weightsLen: bodyBuffer.byteLength / 4, duplicate: true }
+  }
+
   const floatCount = bodyBuffer.byteLength / 4
   const vecKey = REDIS_KEYS.jobWeightsVector(jobId, roundNum, device.id)
   await redis.setex(vecKey, ROUND_CACHE_TTL_SECONDS, bodyBuffer)
@@ -929,11 +947,9 @@ export async function reassignDroppedDeviceTrainingTask(io, droppedDeviceId) {
 
     logger.info(`Task ${activeTask.id} reassigned from ${droppedDeviceId} to ${bestDevice.id}`)
   } else {
-    await prisma.taskAssignment.update({
-      where: { id: activeTask.id },
-      data: { status: 'FAILED' },
-    })
-    logger.warn(`No eligible device to reassign task ${activeTask.id} — marked FAILED`)
+    logger.warn(
+      `No eligible device to reassign task ${activeTask.id} — keeping IN_PROGRESS for device ${droppedDeviceId} to reclaim on reconnect`
+    )
   }
 
   await checkRoundCompletion(io, activeTask.jobId, activeTask.roundNum)

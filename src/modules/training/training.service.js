@@ -330,8 +330,11 @@ export class TrainingService {
 
       if (device.socketId) {
         const assignment = assignmentsByDeviceId.get(device.id)
+        const packaged = packageGlobalWeightsForEmit({ modelType, jobId, globalWeights })
         logger.info(
-          `Round ${roundNum} dispatched — globalWeights length: ${globalWeights ? globalWeights.length : 0}, epochs: ${epochs}`
+          `Round ${roundNum} dispatched — globalWeights socket length: ${packaged.globalWeights?.length ?? 0}` +
+            (packaged.checkpointKey ? ` (redis key ${packaged.checkpointKey})` : '') +
+            `, epochs: ${epochs}`
         )
         emitTrainingTaskAssigned(this.io, {
           device,
