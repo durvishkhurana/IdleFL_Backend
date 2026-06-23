@@ -4,9 +4,15 @@ import { scoreDevice } from '../../utils/deviceScoring.js'
 import { logger } from '../../config/logger.js'
 import {
   clearDeviceDisconnectGrace,
+  isDeviceInDisconnectGrace,
   markDeviceDisconnected,
   scheduleReassignAfterGrace,
 } from '../../utils/deviceDisconnectGrace.js'
+import {
+  evaluateTrainingRejoin,
+  emitTrainingJoinBlocked,
+  getActiveTrainingJob,
+} from '../../utils/sessionTrainingJoin.js'
 import {
   reassignDroppedDeviceTrainingTask,
   recoverStuckRoundIfNeeded,
@@ -25,15 +31,15 @@ export function registerDeviceHandlers(io, socket) {
         return
       }
 
-      // Pass through agent value unchanged (expected: CUDA | MPS | CPU). Default only when absent.
       const resolvedComputeType = computeType ?? 'CPU'
 
-      // Reconnect stability: reuse the existing Device row for this user+session.
-      // This avoids duplicate "live devices" entries when the socket reconnects.
       const existing = await prisma.device.findFirst({
         where: { sessionId: session.id, userId: user.id },
         select: { id: true },
       })
+
+      const graceBeforeRegister = existing ? await isDeviceInDisconnectGrace(existing.id) : false
+      const activeJob = await getActiveTrainingJob(session.id)
 
       const now = new Date()
       const device = existing
@@ -66,9 +72,42 @@ export function registerDeviceHandlers(io, socket) {
         JSON.stringify({ id: device.id, sessionId: session.id, userId: user.id, socketId: socket.id, computeType: device.computeType })
       )
 
-      logger.info(`Device registered: ${user.userId} in session ${sessionCode} (${device.computeType})`)
+      let trainingParticipation = 'none'
+      let mayReceiveTrainingTasks = true
 
-      socket.emit('device:registered', { deviceId: device.id, sessionId: session.id })
+      if (activeJob) {
+        if (!existing) {
+          mayReceiveTrainingTasks = false
+          trainingParticipation = 'observer'
+          emitTrainingJoinBlocked(socket, {
+            reason: 'training_in_progress_new_device',
+            job: activeJob,
+          })
+        } else {
+          const rejoin = await evaluateTrainingRejoin(device.id, session.id, {
+            wasDisconnectGrace: graceBeforeRegister,
+          })
+          if (!rejoin.allowed) {
+            mayReceiveTrainingTasks = false
+            trainingParticipation = 'observer'
+            emitTrainingJoinBlocked(socket, { reason: rejoin.reason, job: rejoin.job })
+          } else {
+            trainingParticipation = 'participant'
+          }
+        }
+      }
+
+      logger.info(
+        `Device registered: ${user.userId} in session ${sessionCode} (${device.computeType}) participation=${trainingParticipation}`
+      )
+
+      socket.emit('device:registered', {
+        deviceId: device.id,
+        sessionId: session.id,
+        trainingParticipation,
+        activeJobId: activeJob?.id ?? null,
+        currentRound: activeJob?.currentRound ?? null,
+      })
 
       if (!existing) {
         io.to(session.id).emit('device:joined', {
@@ -80,6 +119,7 @@ export function registerDeviceHandlers(io, socket) {
             computeType: resolvedComputeType,
             status: 'ACTIVE',
             computeScore: 0.5,
+            trainingParticipation,
           },
         })
       } else {
@@ -88,23 +128,26 @@ export function registerDeviceHandlers(io, socket) {
           status: 'ACTIVE',
           os: device.os,
           computeType: resolvedComputeType,
+          trainingParticipation,
         })
 
-        const taskRaw = await redis.get(REDIS_KEYS.deviceTask(device.id))
-        if (taskRaw) {
-          try {
-            const task = JSON.parse(taskRaw)
-            if (task?.jobId) {
-              await recoverStuckRoundIfNeeded(io, task.jobId)
+        if (mayReceiveTrainingTasks && activeJob) {
+          const taskRaw = await redis.get(REDIS_KEYS.deviceTask(device.id))
+          if (taskRaw) {
+            try {
+              const task = JSON.parse(taskRaw)
+              if (task?.jobId) {
+                await recoverStuckRoundIfNeeded(io, task.jobId)
+              }
+            } catch {
+              // ignore
             }
-          } catch {
-            // ignore
           }
-        }
 
-        await redeliverInProgressTaskForDevice(io, device.id).catch((err) => {
-          logger.error(`redeliverInProgressTaskForDevice failed for ${device.id}:`, err)
-        })
+          await redeliverInProgressTaskForDevice(io, device.id).catch((err) => {
+            logger.error(`redeliverInProgressTaskForDevice failed for ${device.id}:`, err)
+          })
+        }
       }
     } catch (error) {
       logger.error('device:register error:', error)
@@ -150,7 +193,6 @@ export function registerDeviceHandlers(io, socket) {
     }
   })
 
-  // Device disconnects — defer task reassignment so agents can reconnect within the grace window.
   socket.on('disconnect', async () => {
     if (!socket.deviceId) return
 

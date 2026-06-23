@@ -1,6 +1,7 @@
 import { prisma } from '../../config/database.js'
 import { redis, REDIS_KEYS } from '../../config/redis.js'
 import { filterEligibleDevicesAsync } from '../../utils/deviceEligibility.js'
+import { filterToJobParticipantDevices } from '../../utils/sessionTrainingJoin.js'
 import { partitionDataset } from '../../utils/dataPartitioner.js'
 import { logger } from '../../config/logger.js'
 import { config as appConfig } from '../../config/app.js'
@@ -243,7 +244,16 @@ export class TrainingService {
     globalWeights,
     devices,
   }) {
-    const shards = await partitionDataset({ datasetPath, totalRows, devices, modelType })
+    let roundDevices = devices
+    if (roundNum > 1) {
+      roundDevices = await filterToJobParticipantDevices(jobId, devices)
+      if (roundDevices.length === 0) {
+        logger.warn(`Job ${jobId} round ${roundNum}: no prior participants in device list — skipping dispatch`)
+        return
+      }
+    }
+
+    const shards = await partitionDataset({ datasetPath, totalRows, devices: roundDevices, modelType })
     const activeDevices = devices.filter((device) => shards.some((shard) => shard.deviceId === device.id))
 
     await prisma.taskAssignment.deleteMany({
