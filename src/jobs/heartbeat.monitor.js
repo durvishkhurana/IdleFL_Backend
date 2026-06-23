@@ -11,6 +11,7 @@
 import { prisma } from '../config/database.js'
 import { logger } from '../config/logger.js'
 import { reassignDroppedDeviceTrainingTask } from '../socket/handlers/training.handler.js'
+import { isDeviceInDisconnectGrace } from '../utils/deviceDisconnectGrace.js'
 
 const HEARTBEAT_TIMEOUT_MS = (parseInt(process.env.HEARTBEAT_TIMEOUT_SECONDS) || 90) * 1000
 
@@ -41,6 +42,10 @@ async function checkForTimedOutDevices(io) {
   if (timedOut.length === 0) return
 
   for (const device of timedOut) {
+    if (await isDeviceInDisconnectGrace(device.id)) {
+      continue
+    }
+
     logger.warn(`Device timed out: ${device.id} (${device.deviceName}) in session ${device.session?.sessionCode}`)
 
     const droppedDevice = await prisma.device.update({

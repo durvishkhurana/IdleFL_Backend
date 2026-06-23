@@ -5,7 +5,11 @@ import { redis, REDIS_KEYS } from '../../config/redis.js'
 import { computeWeightedRoundMetrics, fedAvgAggregate } from '../../modules/training/fedavg.js'
 import { getTrainingService, emitTrainingTaskAssigned } from '../../modules/training/training.service.js'
 import { PARTICIPATION_THRESHOLD, ROUND_TIMEOUT_SECONDS } from '../../modules/training/training.constants.js'
-import { filterEligibleDevices } from '../../utils/deviceScoring.js'
+import { filterEligibleDevicesAsync } from '../../utils/deviceEligibility.js'
+import {
+  DISCONNECT_GRACE_SECONDS,
+  isDeviceInDisconnectGrace,
+} from '../../utils/deviceDisconnectGrace.js'
 import { getShardPayload } from '../../utils/dataPartitioner.js'
 import { logger } from '../../config/logger.js'
 
@@ -105,6 +109,101 @@ export async function recoverStuckRoundIfNeeded(io, jobId) {
   )
 }
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * Re-emits training:task_assigned when an agent reconnects inside the disconnect grace window.
+ * @param {import('socket.io').Server} io
+ * @param {string} deviceId
+ */
+export async function redeliverInProgressTaskForDevice(io, deviceId) {
+  const device = await prisma.device.findUnique({ where: { id: deviceId } })
+  if (!device?.socketId) return
+
+  const assignment = await prisma.taskAssignment.findFirst({
+    where: { deviceId, status: 'IN_PROGRESS' },
+    include: { job: true },
+    orderBy: { createdAt: 'desc' },
+  })
+  if (!assignment?.job || assignment.job.status !== 'RUNNING') return
+  if (assignment.job.currentRound !== assignment.roundNum) return
+
+  const job = assignment.job
+
+  let globalWeights = null
+  const gwRaw = await redis.get(REDIS_KEYS.jobGlobalWeights(job.id))
+  if (gwRaw) {
+    try {
+      globalWeights = JSON.parse(gwRaw)
+    } catch {
+      globalWeights = null
+    }
+  }
+
+  let mu = 0.01
+  const stateRaw = await redis.get(REDIS_KEYS.jobState(job.id))
+  if (stateRaw) {
+    try {
+      const parsed = JSON.parse(stateRaw)
+      if (Number.isFinite(Number(parsed?.mu))) {
+        mu = Number(parsed.mu)
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  const shard = await getShardPayload({
+    datasetPath: job.datasetPath,
+    modelType: job.modelType,
+    shardStart: assignment.shardStart,
+    shardEnd: assignment.shardEnd,
+    shardSize: assignment.shardSize,
+  })
+
+  logger.info(
+    `Redelivering round ${assignment.roundNum} task ${assignment.id} to device ${deviceId} (reconnect)`
+  )
+
+  emitTrainingTaskAssigned(io, {
+    device,
+    assignment,
+    shard,
+    jobId: job.id,
+    roundNum: assignment.roundNum,
+    modelType: job.modelType,
+    learningRate: job.learningRate,
+    batchSize: job.batchSize,
+    mu,
+    globalWeights,
+    checkpointPath: assignment.checkpointPath,
+  })
+}
+
+/**
+ * Waits up to DISCONNECT_GRACE_SECONDS for devices in disconnect grace to regain a socket.
+ * @param {string[]} deviceIds
+ */
+async function waitForReconnectingDevices(deviceIds) {
+  if (!deviceIds.length) return []
+
+  const deadline = Date.now() + DISCONNECT_GRACE_SECONDS * 1000
+  while (Date.now() < deadline) {
+    const devices = await prisma.device.findMany({ where: { id: { in: deviceIds } } })
+    let waiting = false
+    for (const device of devices) {
+      if (device.socketId || device.status === 'DROPPED') continue
+      if (await isDeviceInDisconnectGrace(device.id)) {
+        waiting = true
+      }
+    }
+    if (!waiting) return devices
+    await sleep(500)
+  }
+
+  return prisma.device.findMany({ where: { id: { in: deviceIds } } })
+}
+
 async function getWeightsChunkState(jobId, roundNum, deviceId) {
   const raw = await redis.get(REDIS_KEYS.jobWeightsChunk(jobId, roundNum, deviceId))
   return raw ? JSON.parse(raw) : null
@@ -121,8 +220,6 @@ async function saveWeightsChunkState(jobId, roundNum, deviceId, state) {
 async function clearWeightsChunkState(jobId, roundNum, deviceId) {
   await redis.del(REDIS_KEYS.jobWeightsChunk(jobId, roundNum, deviceId))
 }
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 async function getRoundContributions(jobId, roundNum) {
   const raw = await redis.get(REDIS_KEYS.jobWeights(jobId, roundNum))
@@ -458,12 +555,30 @@ async function dispatchNextRound({ io, job, nextRound, globalWeights }) {
     throw new Error(`Session ${job.sessionId} not found for job ${job.id}`)
   }
 
-  const eligibleDevices = filterEligibleDevices(session.devices)
+  const eligibleDevices = await filterEligibleDevicesAsync(session.devices)
   if (eligibleDevices.length === 0) {
     await prisma.trainingJob.update({ where: { id: job.id }, data: { status: 'PENDING' } })
     io.to(job.sessionId).emit('training:paused', {
       reason: 'no_eligible_devices',
       message: 'Training paused because no eligible devices were available for the next round.',
+    })
+    return
+  }
+
+  const refreshedDevices = await waitForReconnectingDevices(eligibleDevices.map((d) => d.id))
+  const deviceById = new Map(refreshedDevices.map((d) => [d.id, d]))
+  const devicesForDispatch = eligibleDevices
+    .map((d) => deviceById.get(d.id) || d)
+    .filter((d) => d.socketId)
+
+  if (devicesForDispatch.length === 0) {
+    logger.warn(
+      `Job ${job.id} round ${nextRound}: no devices with active sockets after ${DISCONNECT_GRACE_SECONDS}s grace — pausing`
+    )
+    await prisma.trainingJob.update({ where: { id: job.id }, data: { status: 'PENDING' } })
+    io.to(job.sessionId).emit('training:paused', {
+      reason: 'devices_offline',
+      message: `No agents reconnected within ${DISCONNECT_GRACE_SECONDS}s. Reconnect agents and resume from the dashboard.`,
     })
     return
   }
@@ -494,7 +609,7 @@ async function dispatchNextRound({ io, job, nextRound, globalWeights }) {
     mu,
     roundNum: nextRound,
     globalWeights,
-    devices: eligibleDevices,
+    devices: devicesForDispatch,
   })
 }
 
@@ -696,7 +811,7 @@ export async function reassignDroppedDeviceTrainingTask(io, droppedDeviceId) {
   }
 
   const remainingDevices = activeTask.job.session.devices.filter(
-    (d) => d.id !== droppedDeviceId && d.status !== 'DROPPED' && d.status !== 'DISCONNECTED'
+    (d) => d.id !== droppedDeviceId && d.status !== 'DROPPED'
   )
 
   const assignedThisRound = await prisma.taskAssignment.findMany({
@@ -709,7 +824,7 @@ export async function reassignDroppedDeviceTrainingTask(io, droppedDeviceId) {
       .map((a) => a.deviceId)
   )
 
-  const eligible = filterEligibleDevices(remainingDevices).filter((d) => !busyIds.has(d.id))
+  const eligible = (await filterEligibleDevicesAsync(remainingDevices)).filter((d) => !busyIds.has(d.id))
 
   await prisma.taskAssignment.update({
     where: { id: activeTask.id },

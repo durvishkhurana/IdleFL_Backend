@@ -2,7 +2,16 @@ import { prisma } from '../../config/database.js'
 import { redis, REDIS_KEYS } from '../../config/redis.js'
 import { scoreDevice } from '../../utils/deviceScoring.js'
 import { logger } from '../../config/logger.js'
-import { reassignDroppedDeviceTrainingTask, recoverStuckRoundIfNeeded } from './training.handler.js'
+import {
+  clearDeviceDisconnectGrace,
+  markDeviceDisconnected,
+  scheduleReassignAfterGrace,
+} from '../../utils/deviceDisconnectGrace.js'
+import {
+  reassignDroppedDeviceTrainingTask,
+  recoverStuckRoundIfNeeded,
+  redeliverInProgressTaskForDevice,
+} from './training.handler.js'
 
 export function registerDeviceHandlers(io, socket) {
   const { user } = socket
@@ -49,6 +58,8 @@ export function registerDeviceHandlers(io, socket) {
       socket.deviceId = device.id
       socket.sessionId = session.id
 
+      await clearDeviceDisconnectGrace(device.id)
+
       await redis.setex(
         REDIS_KEYS.device(device.id),
         300,
@@ -79,8 +90,6 @@ export function registerDeviceHandlers(io, socket) {
           computeType: resolvedComputeType,
         })
 
-        // Device is reconnecting — if this process restarted mid-round, the in-memory round timer
-        // may be lost. If the device still has an assigned job in Redis, attempt round recovery.
         const taskRaw = await redis.get(REDIS_KEYS.deviceTask(device.id))
         if (taskRaw) {
           try {
@@ -92,6 +101,8 @@ export function registerDeviceHandlers(io, socket) {
             // ignore
           }
         }
+
+        await redeliverInProgressTaskForDevice(io, device.id)
       }
     } catch (error) {
       logger.error('device:register error:', error)
@@ -137,23 +148,35 @@ export function registerDeviceHandlers(io, socket) {
     }
   })
 
-  // Device disconnects
+  // Device disconnects — defer task reassignment so agents can reconnect within the grace window.
   socket.on('disconnect', async () => {
     if (!socket.deviceId) return
 
+    const deviceId = socket.deviceId
+    const sessionId = socket.sessionId
+
     try {
-      await reassignDroppedDeviceTrainingTask(io, socket.deviceId)
+      await markDeviceDisconnected(deviceId)
 
       await prisma.device.update({
-        where: { id: socket.deviceId },
+        where: { id: deviceId },
         data: { status: 'DISCONNECTED', socketId: null },
       })
 
-      if (socket.sessionId) {
-        io.to(socket.sessionId).emit('device:disconnected', { deviceId: socket.deviceId })
+      if (sessionId) {
+        io.to(sessionId).emit('device:disconnected', { deviceId })
       }
 
-      logger.info(`Device disconnected: ${socket.deviceId}`)
+      logger.info(`Device disconnected: ${deviceId} (grace before reassignment)`)
+
+      scheduleReassignAfterGrace(deviceId, async () => {
+        const current = await prisma.device.findUnique({ where: { id: deviceId }, select: { socketId: true } })
+        if (current?.socketId) {
+          logger.info(`Device ${deviceId} reconnected before grace expired — skip reassignment`)
+          return
+        }
+        await reassignDroppedDeviceTrainingTask(io, deviceId)
+      })
     } catch (error) {
       logger.error('disconnect handler error:', error)
     }

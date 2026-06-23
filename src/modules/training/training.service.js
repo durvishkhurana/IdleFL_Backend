@@ -1,6 +1,6 @@
 import { prisma } from '../../config/database.js'
 import { redis, REDIS_KEYS } from '../../config/redis.js'
-import { filterEligibleDevices } from '../../utils/deviceScoring.js'
+import { filterEligibleDevicesAsync } from '../../utils/deviceEligibility.js'
 import { partitionDataset } from '../../utils/dataPartitioner.js'
 import { logger } from '../../config/logger.js'
 import { config as appConfig } from '../../config/app.js'
@@ -104,7 +104,7 @@ export class TrainingService {
     if (!session) throw Object.assign(new Error('Session not found'), { status: 404 })
     if (session.coordinatorId !== userId) throw Object.assign(new Error('Only coordinator can start training'), { status: 403 })
 
-    const eligible = filterEligibleDevices(session.devices)
+    const eligible = await filterEligibleDevicesAsync(session.devices)
     if (eligible.length === 0) {
       throw Object.assign(new Error('No eligible devices. Need at least one device with score >= 0.3'), { status: 400 })
     }

@@ -1,9 +1,20 @@
+# Dependencies
 node_modules/
+
+# Local env (never commit real secrets — .env.example is tracked)
 .env
+.env.*
+!.env.example
+
+# Runtime output
 uploads/
 logs/
-dist/
 *.log
+
+# Build
+dist/
+
+# OS
 .DS_Store
-prisma/migrations/
-readme.md
+
+# NOTE: prisma/migrations/ IS committed — it is required for `prisma migrate deploy`.

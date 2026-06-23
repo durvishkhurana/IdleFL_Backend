@@ -46,6 +46,7 @@ JWT_TOKEN = ""
 SERVER_URL = 'SERVER_URL_PLACEHOLDER'
 
 HEARTBEAT_INTERVAL_SECONDS = 30
+KEEPALIVE_INTERVAL_SECONDS = float(os.environ.get("IDLEFL_KEEPALIVE_SECONDS", "3"))
 DEFAULT_LEARNING_RATE = 0.01
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_EPOCHS = 1
@@ -55,6 +56,15 @@ MOCK_WEIGHT_SIZE = 16
 # - "bin" (default): Socket.IO binary + server ack
 # - "chunk": JSON chunks (fallback)
 CNN_UPLOAD_MODE = os.environ.get("IDLEFL_CNN_UPLOAD_MODE", "bin").strip().lower()
+
+
+def _server_health_url():
+    base = SERVER_URL.rstrip("/")
+    if base.startswith("wss://"):
+        base = "https://" + base[len("wss://") :]
+    elif base.startswith("ws://"):
+        base = "http://" + base[len("ws://") :]
+    return f"{base}/health"
 
 
 def detect_hardware():
@@ -1162,18 +1172,20 @@ async def run_agent():
             if sio.connected:
                 stats = get_stats()
                 await sio.emit("heartbeat", {**stats, "computeType": compute_type})
-                # Ping HTTP health endpoint to prevent Render free dyno sleep.
+
+    async def keepalive_loop():
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as http_sess:
+            while True:
+                await asyncio.sleep(KEEPALIVE_INTERVAL_SECONDS)
                 try:
-                    async with aiohttp.ClientSession() as session:
-                        await session.get(
-                            SERVER_URL.replace("wss://", "https://").replace("ws://", "http://") + "/health",
-                            timeout=aiohttp.ClientTimeout(total=5),
-                        )
+                    await http_sess.get(_server_health_url())
                 except Exception:
-                    pass  # non-critical
+                    pass
 
     await sio.connect(SERVER_URL, auth={"token": token}, transports=["websocket"])
     asyncio.create_task(heartbeat_loop())
+    asyncio.create_task(keepalive_loop())
     await sio.wait()
 
 

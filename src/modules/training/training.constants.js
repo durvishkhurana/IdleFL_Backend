@@ -14,6 +14,9 @@ export const ROUND_TIMEOUT_SECONDS = parseInt(process.env.ROUND_TIMEOUT_SECONDS)
 // Fallback: aggregate with whoever submitted after this many seconds
 // even if PARTICIPATION_THRESHOLD was never reached.
 
+/** Grace period before reassigning tasks after a socket disconnect (seconds). */
+export const DISCONNECT_GRACE_SECONDS = parseInt(process.env.DISCONNECT_GRACE_SECONDS) || 15
+
 export function epochsForModelType(modelType) {
   return EPOCHS_PER_MODEL[modelType] ?? 1
 }
